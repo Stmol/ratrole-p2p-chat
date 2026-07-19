@@ -1,0 +1,13 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local environment and editor files
+.env
+.env.*
+.DS_Store
+*.swp
+*.swo
+
+# Local planning artifacts
+/docs/
