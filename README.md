@@ -6,13 +6,21 @@ The first client is a Rust terminal application. Future compatible clients may b
 
 ## Product model
 
-- A **user peer ID** is a durable public identity that contacts use.
-- Each device owns a distinct **Iroh device identity**. The user identity authorises and can revoke devices without changing the user peer ID.
-- A 24-word recovery phrase restores the user identity. Device secrets are held by the operating system keychain, never in plaintext configuration.
-- Contacts are local and one-way. Presence metadata is shared only with contacts selected by its owner.
-- Rathole ships a versioned bootstrap relay list, including n0 relay infrastructure. Users will be able to inspect, add, remove, and replace relay entries.
+- The current MVP peer ID is this installation’s Iroh `EndpointId`.
+- The Iroh device secret is held by the operating system keychain, never in plaintext configuration.
+- Contacts are local and one-way. Adding a contact only validates and stores an EndpointId locally.
+- Rathole ships a versioned bootstrap relay list, including n0 relay infrastructure. Relay persistence and mutation remain future work.
+- A durable multi-device `UserPeerId`, recovery phrases, presence exchange, and chat transport are future subsystems.
 
-Payload transfer, secure identity storage, device authorisation, presence exchange, contact persistence, and relay mutation are deliberately future subsystems. This repository currently provides their boundaries, not a misleading mock implementation.
+## Identity and contacts (MVP)
+
+- The displayed peer ID is this installation’s Iroh EndpointId.
+- The device secret is held by the OS keychain and must not be copied or shared.
+- Use Contacts → x → Copy my ID to share the public ID.
+- Use Contacts → x → Add contact to paste another Iroh EndpointId.
+- Adding a contact only validates and saves the ID locally. It does not verify that the peer is online, reachable, or has accepted the contact.
+- contacts.toml is temporary public storage and will later migrate to SQLite.
+- Replacing a device key changes the peer ID; UserPeerId and multi-device migration are future work.
 
 ## Run
 
@@ -22,30 +30,28 @@ Install the stable Rust toolchain, then run:
 cargo run
 ```
 
-Launching without arguments opens the terminal UI preview. Explicit commands are reserved for focused automation and will report their bootstrap status until their domain behaviour is implemented.
+Launching without arguments opens the terminal UI. Explicit commands are reserved for focused automation and will report their bootstrap status until their domain behaviour is implemented.
 
 ```sh
 cargo run -- --version
 cargo test
 ```
 
-## Terminal UI preview
+## Terminal UI
 
-Running `rathole` without arguments opens a keyboard-first UI preview backed by
-in-memory demo data. Contacts, presence values, relay state, chat history, and
-context-menu changes are not loaded from or written to persistent storage.
-Message submission is deliberately unavailable.
+Running `rathole` without arguments opens a keyboard-first UI backed by the
+local peer identity and contact list. Messaging is not implemented yet.
 
-The preview is composed from internal TUI components. `TuiApp` owns demo data
-and applies UI commands, while List, Chat, Details, and modal state stay local
-to their presentation components. Colours, geometry, and component spacing are
+The UI is composed from internal TUI components. `TuiApp` owns view data and
+applies UI commands, while List, Chat, Details, and modal state stay local to
+their presentation components. Colours, geometry, and component spacing are
 provided by an in-memory `UiConfig` preset when the app is created; Rathole
 does not read a TUI configuration file or switch presets at runtime.
 
 - `Tab` / `Shift+Tab`: cycle List, Chat, and Details
 - `j/k` or arrow keys: select or scroll in the focused panel
 - `h/l` or left/right: switch Contacts and Relays while List is focused
-- `x`: open the focused item’s context menu in Normal mode
+- `x`: open the Contacts / Relays / Chat context menu in Normal mode
 - `i` or `Enter`: enter Chat Insert mode
 - `Esc`: leave Insert mode or close a modal
 - `Ctrl+C`: quit
@@ -58,11 +64,11 @@ show resize guidance.
 
 ```text
 src/
-  application.rs    Command dispatch and application boundary
+  application.rs    Bootstrap, effect handling, and command dispatch
   cli.rs            Command-line parsing
   domain/           Transport-independent product concepts
-  network/          Iroh transport boundary
-  storage/          Application data path boundary
+  network/          Iroh EndpointId / SecretKey boundary
+  storage/          Keychain device secret and contacts.toml repository
   tui/              Ratatui presentation and input loop
 tests/              Black-box binary tests
 ```

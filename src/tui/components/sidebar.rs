@@ -1,9 +1,11 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarState},
+    widgets::{
+        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarState, Wrap,
+    },
 };
 
 use crate::domain::relay::RelaySource;
@@ -11,7 +13,7 @@ use crate::tui::{
     action::SidebarTab,
     components::props::SidebarProps,
     config::SidebarConfig,
-    model::MockPresence,
+    model::short_peer_id,
     theme::{UiTheme, panel_block_with_theme},
 };
 
@@ -42,7 +44,7 @@ pub fn render_sidebar(
 
     let list_area = padded_vertical(list_area, config.content_padding_y).unwrap_or(list_area);
     match props.tab {
-        SidebarTab::Contacts => render_contacts(frame, list_area, &props, config, theme),
+        SidebarTab::Contacts => render_contacts(frame, list_area, &props, theme),
         SidebarTab::Relays => render_relays(frame, list_area, &props, config, theme),
     }
 }
@@ -69,17 +71,12 @@ fn tab_label_style(selected: bool, theme: &UiTheme) -> Style {
     }
 }
 
-fn render_contacts(
-    frame: &mut Frame,
-    area: Rect,
-    props: &SidebarProps<'_>,
-    config: &SidebarConfig,
-    theme: &UiTheme,
-) {
+fn render_contacts(frame: &mut Frame, area: Rect, props: &SidebarProps<'_>, theme: &UiTheme) {
     if props.contacts.is_empty() {
         frame.render_widget(
-            ratatui::widgets::Paragraph::new("No contacts in this demo")
-                .style(Style::new().fg(theme.muted).bg(theme.panel)),
+            Paragraph::new("No contacts — x to add a peer")
+                .style(Style::new().fg(theme.muted).bg(theme.panel))
+                .wrap(Wrap { trim: true }),
             area,
         );
         return;
@@ -89,12 +86,10 @@ fn render_contacts(
         .contacts
         .iter()
         .map(|contact| {
-            let (dot, color, label) = presence_parts(contact.presence, config, theme);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{dot} "), Style::new().fg(color)),
-                Span::styled(contact.name.clone(), Style::new().fg(theme.text)),
-                Span::styled(format!(" {label}"), Style::new().fg(theme.muted)),
-            ]))
+            ListItem::new(Line::from(Span::styled(
+                short_peer_id(&contact.peer_id),
+                Style::new().fg(theme.text),
+            )))
         })
         .collect();
 
@@ -108,6 +103,15 @@ fn render_relays(
     config: &SidebarConfig,
     theme: &UiTheme,
 ) {
+    if props.relays.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No relays configured")
+                .style(Style::new().fg(theme.muted).bg(theme.panel)),
+            area,
+        );
+        return;
+    }
+
     let items: Vec<ListItem> = props
         .relays
         .iter()
@@ -176,18 +180,6 @@ fn padded_vertical(area: Rect, padding: u16) -> Option<Rect> {
     ))
 }
 
-fn presence_parts(
-    presence: MockPresence,
-    config: &SidebarConfig,
-    theme: &UiTheme,
-) -> (&'static str, Color, &'static str) {
-    match presence {
-        MockPresence::Online => (config.active_glyph, theme.green, "online"),
-        MockPresence::Away => (config.active_glyph, theme.amber, "away"),
-        MockPresence::Offline => (config.inactive_glyph, theme.muted, "offline"),
-    }
-}
-
 pub(crate) fn compact_relay_host(url: &str) -> String {
     let without_scheme = url
         .strip_prefix("https://")
@@ -198,39 +190,143 @@ pub(crate) fn compact_relay_host(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
 
     use super::*;
-    use crate::tui::{TuiApp, action::SidebarTab, config::UiConfig, theme::UiTheme};
+    use crate::{
+        network::identity::peer_id_from_secret,
+        tui::{
+            action::SidebarTab,
+            components::props::SidebarProps,
+            config::UiConfig,
+            model::{ContactView, RelayView},
+            theme::UiTheme,
+        },
+    };
 
     #[test]
-    fn contacts_empty_state_message() {
-        let mut app = TuiApp::demo();
-        app.data.contacts.clear();
-        let text = render_sidebar_text(&app, 30, 16);
-        assert!(text.contains("No contacts in this demo"));
+    fn empty_contacts_explain_how_to_add_a_peer() {
+        let text = render_sidebar_props(
+            SidebarProps {
+                focused: true,
+                tab: SidebarTab::Contacts,
+                contacts: &[],
+                relays: &[],
+                selected: 0,
+            },
+            &UiConfig::default().sidebar,
+            &UiTheme::default(),
+            40,
+            16,
+        );
+        assert!(text.contains("No contacts"));
+        assert!(text.contains("x to add a peer"));
+        assert!(!text.contains("demo"));
     }
 
     #[test]
-    fn relays_show_built_in_label() {
-        let app = TuiApp::demo();
-        let config = UiConfig::default();
-        let props = crate::tui::components::props::SidebarProps {
-            focused: false,
-            tab: SidebarTab::Relays,
-            contacts: &app.data.contacts,
-            relays: &app.data.relays,
-            selected: 0,
-        };
-        let text = render_sidebar_props(props, &config.sidebar, &UiTheme::default(), 48, 16);
+    fn empty_contacts_wrap_when_sidebar_is_narrow() {
+        let text = render_sidebar_props(
+            SidebarProps {
+                focused: true,
+                tab: SidebarTab::Contacts,
+                contacts: &[],
+                relays: &[],
+                selected: 0,
+            },
+            &UiConfig::default().sidebar,
+            &UiTheme::default(),
+            18,
+            16,
+        );
+        let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+        assert!(
+            lines.iter().any(|line| line.contains("No contacts")),
+            "missing wrapped empty-state copy in:\n{text}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("to add a peer")),
+            "missing wrapped empty-state hint in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn empty_relays_explain_they_are_unconfigured() {
+        let text = render_sidebar_props(
+            SidebarProps {
+                focused: false,
+                tab: SidebarTab::Relays,
+                contacts: &[],
+                relays: &[],
+                selected: 0,
+            },
+            &UiConfig::default().sidebar,
+            &UiTheme::default(),
+            48,
+            16,
+        );
+        assert!(text.contains("No relays configured"));
+    }
+
+    #[test]
+    fn relays_show_built_in_label_when_present() {
+        let relays = [RelayView {
+            id: 0,
+            url: "https://relay.example.test".into(),
+            source: RelaySource::BuiltIn,
+            enabled: true,
+        }];
+        let text = render_sidebar_props(
+            SidebarProps {
+                focused: false,
+                tab: SidebarTab::Relays,
+                contacts: &[],
+                relays: &relays,
+                selected: 0,
+            },
+            &UiConfig::default().sidebar,
+            &UiTheme::default(),
+            48,
+            16,
+        );
         assert!(text.contains("built-in"));
-        assert!(text.contains("user"));
+    }
+
+    #[test]
+    fn contacts_row_shows_compact_peer_id() {
+        let contact = ContactView::from_peer_id(peer_id_for_test(4));
+        let text = render_sidebar_props(
+            SidebarProps {
+                focused: true,
+                tab: SidebarTab::Contacts,
+                contacts: std::slice::from_ref(&contact),
+                relays: &[],
+                selected: 0,
+            },
+            &UiConfig::default().sidebar,
+            &UiTheme::default(),
+            40,
+            16,
+        );
+        assert!(text.contains(&short_peer_id(&contact.peer_id)));
+        assert!(!text.contains("presence"));
     }
 
     #[test]
     fn tabs_join_labels_and_superscript_shortcuts() {
-        let app = TuiApp::demo();
-        let text = render_sidebar_text(&app, 30, 16);
+        let text = render_sidebar_props(
+            SidebarProps {
+                focused: true,
+                tab: SidebarTab::Contacts,
+                contacts: &[],
+                relays: &[],
+                selected: 0,
+            },
+            &UiConfig::default().sidebar,
+            &UiTheme::default(),
+            30,
+            16,
+        );
 
         assert!(text.contains("Contacts¹"));
         assert!(text.contains("Relays²"));
@@ -239,11 +335,14 @@ mod tests {
     #[test]
     fn shortcut_colors_are_muted_for_both_tab_states() {
         for tab in [SidebarTab::Contacts, SidebarTab::Relays] {
-            let app = TuiApp::demo();
-            let mut props = app.sidebar_props();
-            props.tab = tab;
             let buffer = render_sidebar_props_buffer(
-                props,
+                SidebarProps {
+                    focused: true,
+                    tab,
+                    contacts: &[],
+                    relays: &[],
+                    selected: 0,
+                },
                 &UiConfig::default().sidebar,
                 &UiTheme::default(),
                 30,
@@ -256,29 +355,12 @@ mod tests {
         }
     }
 
-    fn render_sidebar_text(app: &TuiApp, width: u16, height: u16) -> String {
-        buffer_to_string(&render_sidebar_buffer(app, width, height))
-    }
-
-    fn render_sidebar_buffer(app: &TuiApp, width: u16, height: u16) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| {
-                render_sidebar(
-                    frame,
-                    frame.area(),
-                    app.sidebar_props(),
-                    &app.config().sidebar,
-                    &app.config().theme,
-                )
-            })
-            .expect("draw");
-        terminal.backend().buffer().clone()
+    fn peer_id_for_test(byte: u8) -> crate::domain::identity::PeerId {
+        peer_id_from_secret(&iroh::SecretKey::from_bytes(&[byte; 32]))
     }
 
     fn render_sidebar_props(
-        props: crate::tui::components::props::SidebarProps<'_>,
+        props: SidebarProps<'_>,
         config: &crate::tui::config::SidebarConfig,
         theme: &UiTheme,
         width: u16,
@@ -290,7 +372,7 @@ mod tests {
     }
 
     fn render_sidebar_props_buffer(
-        props: crate::tui::components::props::SidebarProps<'_>,
+        props: SidebarProps<'_>,
         config: &crate::tui::config::SidebarConfig,
         theme: &UiTheme,
         width: u16,

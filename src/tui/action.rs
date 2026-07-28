@@ -35,7 +35,7 @@ pub enum SidebarTab {
     Relays,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     Quit,
     FocusNext,
@@ -50,6 +50,7 @@ pub enum Action {
     EnterInsert,
     ExitInsert,
     InsertChar(char),
+    Paste(String),
     Backspace,
     Delete,
     MoveCursor(i16),

@@ -48,6 +48,7 @@ pub(crate) struct InputContext {
     pub focus: Panel,
     pub chat_mode: ChatMode,
     pub overlay_open: bool,
+    pub overlay_text_entry: bool,
 }
 
 pub(crate) fn selected_contact(data: &TuiData, index: usize) -> Option<&ContactView> {

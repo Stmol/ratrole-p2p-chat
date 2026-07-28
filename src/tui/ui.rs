@@ -75,29 +75,56 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::tui::action::Panel;
+    use crate::{
+        network::identity::peer_id_from_secret,
+        tui::{
+            action::Panel,
+            config::UiConfig,
+            model::{ContactView, TuiData, short_peer_id},
+        },
+    };
+
+    fn peer_id_for_test(byte: u8) -> crate::domain::identity::PeerId {
+        peer_id_from_secret(&iroh::SecretKey::from_bytes(&[byte; 32]))
+    }
+
+    fn sample_app() -> TuiApp {
+        let contact = ContactView::from_peer_id(peer_id_for_test(6));
+        TuiApp::new(
+            TuiData {
+                own_peer_id: peer_id_for_test(0),
+                contacts: vec![contact],
+                relays: Vec::new(),
+                chats: Default::default(),
+            },
+            UiConfig::default(),
+        )
+    }
 
     #[test]
     fn wide_render_contains_all_three_panel_titles() {
-        let text = render_text(&TuiApp::demo(), 140, 36);
+        let app = sample_app();
+        let text = render_text(&app, 140, 36);
+        let compact = short_peer_id(&app.data.contacts[0].peer_id);
         assert!(text.contains("Contacts"));
-        assert!(text.contains("Mira Chen"));
+        assert!(text.contains(&compact));
         assert!(text.contains("Contact details"));
         assert!(text.contains("Ctrl+C Quit"));
         assert!(!text.contains("DEMO"));
+        assert!(!text.contains("demo"));
         assert!(!text.contains("NORMAL"));
     }
 
     #[test]
     fn tiny_render_contains_only_resize_guidance() {
-        let text = render_text(&TuiApp::demo(), 39, 11);
+        let text = render_text(&sample_app(), 39, 11);
         assert!(text.contains("Terminal too small"));
         assert!(!text.contains("Contact details"));
     }
 
     #[test]
     fn medium_and_narrow_layouts_render_without_panic() {
-        let mut app = TuiApp::demo();
+        let mut app = sample_app();
         let _ = render_text(&app, 100, 30);
         app.focus = Panel::Details;
         let _ = render_text(&app, 100, 30);

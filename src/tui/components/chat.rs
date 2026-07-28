@@ -10,7 +10,7 @@ use crate::tui::{
     action::ChatMode,
     components::props::ChatProps,
     config::ChatConfig,
-    model::{MessageSender, MessageView},
+    model::{MessageSender, MessageView, short_peer_id},
     theme::{UiTheme, panel_block_with_theme},
 };
 
@@ -64,7 +64,7 @@ pub fn render_chat(
         frame,
         transcript,
         &props,
-        contact.name.as_str(),
+        &short_peer_id(&contact.peer_id),
         config,
         theme,
     );
@@ -73,14 +73,7 @@ pub fn render_chat(
 
 fn chat_title(props: &ChatProps<'_>) -> Line<'static> {
     match props.contact {
-        Some(contact) => {
-            let presence = match contact.presence {
-                crate::tui::model::MockPresence::Online => "mock online",
-                crate::tui::model::MockPresence::Away => "mock away",
-                crate::tui::model::MockPresence::Offline => "mock offline",
-            };
-            Line::from(format!(" {} · {presence} ", contact.name))
-        }
+        Some(contact) => Line::from(format!(" {} ", short_peer_id(&contact.peer_id))),
         None => Line::from(" Chat "),
     }
 }
@@ -96,7 +89,7 @@ fn render_transcript(
     let messages = props.messages;
     if messages.is_empty() {
         frame.render_widget(
-            Paragraph::new("No messages in this demo conversation")
+            Paragraph::new("Messaging is not implemented yet")
                 .style(Style::new().fg(theme.muted).bg(theme.panel)),
             area,
         );
@@ -369,51 +362,119 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, style::Color};
 
     use super::*;
-    use crate::tui::{
-        TuiApp,
-        action::{Action, Panel},
-        config::UiConfig,
-        theme::UiTheme,
+    use crate::{
+        network::identity::peer_id_from_secret,
+        tui::{
+            action::ChatMode,
+            components::props::ChatProps,
+            config::UiConfig,
+            model::{ContactView, MessageSender, MessageView},
+            theme::UiTheme,
+        },
     };
 
     #[test]
+    fn empty_chat_explains_messaging_is_not_implemented() {
+        let contact = ContactView::from_peer_id(peer_id_for_test(5));
+        let text = render_chat_props(
+            ChatProps {
+                focused: true,
+                mode: ChatMode::Normal,
+                cursor_visible: true,
+                contact: Some(&contact),
+                messages: &[],
+                draft: "",
+                cursor: 0,
+                scroll_offset: 0,
+            },
+            70,
+            20,
+        );
+        assert!(text.contains("Messaging is not implemented yet"));
+        assert!(text.contains(&short_peer_id(&contact.peer_id)));
+        assert!(!text.contains("demo"));
+    }
+
+    #[test]
     fn chat_renders_box_drawing_rails_with_matching_gaps_for_both_senders() {
-        let app = TuiApp::demo();
-        let buffer = render_chat_to_buffer(&app, 70, 20);
+        let contact = ContactView::from_peer_id(peer_id_for_test(5));
+        let label = short_peer_id(&contact.peer_id);
+        let messages = sample_messages();
+        let buffer = render_chat_props_buffer(
+            ChatProps {
+                focused: true,
+                mode: ChatMode::Normal,
+                cursor_visible: true,
+                contact: Some(&contact),
+                messages: &messages,
+                draft: "",
+                cursor: 0,
+                scroll_offset: 0,
+            },
+            70,
+            20,
+        );
         let theme = UiTheme::default();
 
-        assert_rail_and_surface_touch(&buffer, "Mira Chen", theme.muted, theme.message);
+        assert_rail_and_surface_touch(&buffer, &label, theme.muted, theme.message);
         assert_rail_and_surface_touch(&buffer, "You", theme.blue, theme.message);
     }
 
     #[test]
     fn chat_pins_messages_to_the_bottom() {
-        let app = TuiApp::demo();
-        let buffer = render_chat_to_buffer(&app, 70, 24);
+        let contact = ContactView::from_peer_id(peer_id_for_test(5));
+        let label = short_peer_id(&contact.peer_id);
+        let messages = sample_messages();
+        let buffer = render_chat_props_buffer(
+            ChatProps {
+                focused: true,
+                mode: ChatMode::Normal,
+                cursor_visible: true,
+                contact: Some(&contact),
+                messages: &messages,
+                draft: "",
+                cursor: 0,
+                scroll_offset: 0,
+            },
+            70,
+            24,
+        );
 
         let you_row = row_containing(&buffer, "You");
-        let mira_row = row_containing(&buffer, "Mira Chen · 21:06");
-        // Spacer + composer sit at the bottom; newest message stays near them.
-        assert!(mira_row < you_row);
+        let peer_row = row_containing(&buffer, &format!("{label} · 21:06"));
+        assert!(peer_row < you_row);
         assert!(you_row >= buffer.area.height.saturating_sub(14));
     }
 
     #[test]
     fn chat_uses_single_row_gap_between_messages() {
-        let app = TuiApp::demo();
-        let buffer = render_chat_to_buffer(&app, 70, 24);
+        let contact = ContactView::from_peer_id(peer_id_for_test(5));
+        let label = short_peer_id(&contact.peer_id);
+        let messages = sample_messages();
+        let buffer = render_chat_props_buffer(
+            ChatProps {
+                focused: true,
+                mode: ChatMode::Normal,
+                cursor_visible: true,
+                contact: Some(&contact),
+                messages: &messages,
+                draft: "",
+                cursor: 0,
+                scroll_offset: 0,
+            },
+            70,
+            24,
+        );
 
-        let mira_body = row_containing(&buffer, "The demo link is ready");
-        let mira_meta = row_containing(&buffer, "Mira Chen · 21:06");
-        let you_body = row_containing(&buffer, "Checking it now");
+        let peer_body = row_containing(&buffer, "First sample message");
+        let peer_meta = row_containing(&buffer, &format!("{label} · 21:06"));
+        let you_body = row_containing(&buffer, "Second sample message");
         let you_meta = row_containing(&buffer, "You · 21:07");
-        assert!(mira_meta > mira_body);
+        assert!(peer_meta > peer_body);
         assert!(you_meta > you_body);
-
-        // Bottom pad of first card, one blank gap, then top pad of second card.
-        assert_eq!(you_body, mira_meta + 4);
+        assert_eq!(you_body, peer_meta + 4);
         assert!(
-            row_text(&buffer, mira_meta + 2)
+            row_text(&buffer, peer_meta + 2)
                 .chars()
                 .all(|character| character == ' ' || character == '│' || character == '|')
         );
@@ -421,8 +482,22 @@ mod tests {
 
     #[test]
     fn chat_separates_composer_with_blank_row() {
-        let app = TuiApp::demo();
-        let buffer = render_chat_to_buffer(&app, 70, 24);
+        let contact = ContactView::from_peer_id(peer_id_for_test(5));
+        let messages = sample_messages();
+        let buffer = render_chat_props_buffer(
+            ChatProps {
+                focused: true,
+                mode: ChatMode::Normal,
+                cursor_visible: true,
+                contact: Some(&contact),
+                messages: &messages,
+                draft: "",
+                cursor: 0,
+                scroll_offset: 0,
+            },
+            70,
+            24,
+        );
 
         let you_row = row_containing(&buffer, "You · 21:07");
         let draft_row = row_containing(&buffer, "Type a message…");
@@ -443,12 +518,22 @@ mod tests {
 
     #[test]
     fn composer_shows_a_highlighted_cursor_in_insert_mode() {
-        let mut app = TuiApp::demo();
-        app.focus = Panel::Chat;
-        app.update(Action::EnterInsert);
-        app.update(Action::InsertChar('a'));
-        app.update(Action::MoveCursor(-1));
-        let buffer = render_chat_to_buffer(&app, 70, 24);
+        let contact = ContactView::from_peer_id(peer_id_for_test(5));
+        let draft = "a";
+        let buffer = render_chat_props_buffer(
+            ChatProps {
+                focused: true,
+                mode: ChatMode::Insert,
+                cursor_visible: true,
+                contact: Some(&contact),
+                messages: &[],
+                draft,
+                cursor: 0,
+                scroll_offset: 0,
+            },
+            70,
+            24,
+        );
         let theme = UiTheme::default();
 
         let cursor = (0..buffer.area.height)
@@ -464,11 +549,21 @@ mod tests {
 
     #[test]
     fn empty_insert_composer_renders_a_cursor_without_panicking() {
-        let mut app = TuiApp::demo();
-        app.focus = Panel::Chat;
-        app.update(Action::EnterInsert);
-
-        let buffer = render_chat_to_buffer(&app, 70, 24);
+        let contact = ContactView::from_peer_id(peer_id_for_test(5));
+        let buffer = render_chat_props_buffer(
+            ChatProps {
+                focused: true,
+                mode: ChatMode::Insert,
+                cursor_visible: true,
+                contact: Some(&contact),
+                messages: &[],
+                draft: "",
+                cursor: 0,
+                scroll_offset: 0,
+            },
+            70,
+            24,
+        );
         let theme = UiTheme::default();
         assert!(
             buffer
@@ -478,17 +573,55 @@ mod tests {
         );
     }
 
-    fn render_chat_to_buffer(app: &TuiApp, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    fn peer_id_for_test(byte: u8) -> crate::domain::identity::PeerId {
+        peer_id_from_secret(&iroh::SecretKey::from_bytes(&[byte; 32]))
+    }
+
+    fn sample_messages() -> Vec<MessageView> {
+        vec![
+            MessageView {
+                sender: MessageSender::Contact,
+                timestamp: "21:06".into(),
+                body: "First sample message".into(),
+            },
+            MessageView {
+                sender: MessageSender::Local,
+                timestamp: "21:07".into(),
+                body: "Second sample message".into(),
+            },
+        ]
+    }
+
+    fn render_chat_props(props: ChatProps<'_>, width: u16, height: u16) -> String {
+        buffer_to_string(&render_chat_props_buffer(props, width, height))
+    }
+
+    fn render_chat_props_buffer(
+        props: ChatProps<'_>,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
                 let config = UiConfig::default();
                 let theme = UiTheme::default();
-                render_chat(frame, frame.area(), app.chat_props(), &config.chat, &theme)
+                render_chat(frame, frame.area(), props, &config.chat, &theme)
             })
             .expect("draw");
         terminal.backend().buffer().clone()
+    }
+
+    fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 
     fn assert_rail_and_surface_touch(

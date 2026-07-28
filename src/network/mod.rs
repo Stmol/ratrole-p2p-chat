@@ -1,3 +1,5 @@
+pub mod identity;
+
 /// Returns the selected transport label while making the Iroh dependency part
 /// of the compiled application boundary.
 pub fn transport_name() -> &'static str {

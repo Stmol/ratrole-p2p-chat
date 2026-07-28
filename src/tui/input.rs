@@ -13,6 +13,9 @@ pub fn action_for_key(context: InputContext, key: KeyEvent) -> Action {
         return Action::Quit;
     }
     if context.overlay_open {
+        if context.overlay_text_entry {
+            return overlay_text_action(key);
+        }
         return overlay_action(key);
     }
     match key.code {
@@ -39,6 +42,26 @@ fn overlay_action(key: KeyEvent) -> Action {
         KeyCode::Char('l') | KeyCode::Right => Action::Navigate(1),
         KeyCode::Enter => Action::Activate,
         KeyCode::Esc => Action::CloseOverlay,
+        _ => Action::Noop,
+    }
+}
+
+fn overlay_text_action(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::CloseOverlay,
+        KeyCode::Enter => Action::Activate,
+        KeyCode::Backspace => Action::Backspace,
+        KeyCode::Delete => Action::Delete,
+        KeyCode::Left => Action::MoveCursor(-1),
+        KeyCode::Right => Action::MoveCursor(1),
+        KeyCode::Home => Action::MoveCursorToStart,
+        KeyCode::End => Action::MoveCursorToEnd,
+        KeyCode::Char(character)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            Action::InsertChar(character)
+        }
         _ => Action::Noop,
     }
 }
@@ -110,56 +133,56 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn context(
+        focus: Panel,
+        chat_mode: ChatMode,
+        overlay_open: bool,
+        overlay_text_entry: bool,
+    ) -> InputContext {
+        InputContext {
+            focus,
+            chat_mode,
+            overlay_open,
+            overlay_text_entry,
+        }
+    }
+
     #[test]
     fn x_opens_context_in_chat_normal_mode() {
-        let context = InputContext {
-            focus: Panel::Chat,
-            chat_mode: ChatMode::Normal,
-            overlay_open: false,
-        };
-
         assert_eq!(
-            action_for_key(context, key(KeyCode::Char('x'))),
+            action_for_key(
+                context(Panel::Chat, ChatMode::Normal, false, false),
+                key(KeyCode::Char('x'))
+            ),
             Action::OpenContextMenu
         );
     }
 
     #[test]
     fn x_is_text_in_chat_insert_mode() {
-        let context = InputContext {
-            focus: Panel::Chat,
-            chat_mode: ChatMode::Insert,
-            overlay_open: false,
-        };
-
         assert_eq!(
-            action_for_key(context, key(KeyCode::Char('x'))),
+            action_for_key(
+                context(Panel::Chat, ChatMode::Insert, false, false),
+                key(KeyCode::Char('x'))
+            ),
             Action::InsertChar('x')
         );
     }
 
     #[test]
     fn tab_remains_global_in_insert_mode() {
-        let context = InputContext {
-            focus: Panel::Chat,
-            chat_mode: ChatMode::Insert,
-            overlay_open: false,
-        };
-
         assert_eq!(
-            action_for_key(context, key(KeyCode::Tab)),
+            action_for_key(
+                context(Panel::Chat, ChatMode::Insert, false, false),
+                key(KeyCode::Tab)
+            ),
             Action::FocusNext
         );
     }
 
     #[test]
     fn number_keys_select_sidebar_tabs_in_normal_mode() {
-        let context = InputContext {
-            focus: Panel::Details,
-            chat_mode: ChatMode::Normal,
-            overlay_open: false,
-        };
-
+        let context = context(Panel::Details, ChatMode::Normal, false, false);
         assert_eq!(
             action_for_key(context, key(KeyCode::Char('1'))),
             Action::SelectSidebarTab(SidebarTab::Contacts)
@@ -172,12 +195,7 @@ mod tests {
 
     #[test]
     fn h_l_and_arrow_keys_switch_sidebar_tabs_while_list_is_focused() {
-        let context = InputContext {
-            focus: Panel::List,
-            chat_mode: ChatMode::Normal,
-            overlay_open: false,
-        };
-
+        let context = context(Panel::List, ChatMode::Normal, false, false);
         assert_eq!(
             action_for_key(context, key(KeyCode::Char('h'))),
             Action::SelectSidebarTab(SidebarTab::Contacts)
@@ -198,12 +216,7 @@ mod tests {
 
     #[test]
     fn number_keys_remain_text_in_chat_insert_mode() {
-        let context = InputContext {
-            focus: Panel::Chat,
-            chat_mode: ChatMode::Insert,
-            overlay_open: false,
-        };
-
+        let context = context(Panel::Chat, ChatMode::Insert, false, false);
         assert_eq!(
             action_for_key(context, key(KeyCode::Char('1'))),
             Action::InsertChar('1')
@@ -216,12 +229,7 @@ mod tests {
 
     #[test]
     fn cursor_navigation_keys_edit_the_draft_position_in_insert_mode() {
-        let context = InputContext {
-            focus: Panel::Chat,
-            chat_mode: ChatMode::Insert,
-            overlay_open: false,
-        };
-
+        let context = context(Panel::Chat, ChatMode::Insert, false, false);
         assert_eq!(
             action_for_key(context, key(KeyCode::Left)),
             Action::MoveCursor(-1)
@@ -246,12 +254,7 @@ mod tests {
 
     #[test]
     fn enter_and_shift_enter_submit_the_draft_in_chat_insert_mode() {
-        let context = InputContext {
-            focus: Panel::Chat,
-            chat_mode: ChatMode::Insert,
-            overlay_open: false,
-        };
-
+        let context = context(Panel::Chat, ChatMode::Insert, false, false);
         assert_eq!(
             action_for_key(context, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
             Action::SubmitDraft
@@ -264,12 +267,7 @@ mod tests {
 
     #[test]
     fn modal_overlay_traps_tab_but_not_control_c() {
-        let context = InputContext {
-            focus: Panel::List,
-            chat_mode: ChatMode::Normal,
-            overlay_open: true,
-        };
-
+        let context = context(Panel::List, ChatMode::Normal, true, false);
         assert_eq!(action_for_key(context, key(KeyCode::Tab)), Action::Noop);
         assert_eq!(
             action_for_key(
@@ -277,6 +275,19 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
             ),
             Action::Quit
+        );
+    }
+
+    #[test]
+    fn add_contact_overlay_accepts_characters_and_esc() {
+        let context = context(Panel::List, ChatMode::Normal, true, true);
+        assert_eq!(
+            action_for_key(context, key(KeyCode::Char('a'))),
+            Action::InsertChar('a')
+        );
+        assert_eq!(
+            action_for_key(context, key(KeyCode::Esc)),
+            Action::CloseOverlay
         );
     }
 }

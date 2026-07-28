@@ -12,7 +12,6 @@ use crate::tui::{
     components::props::DetailsProps,
     components::sidebar::compact_relay_host,
     config::DetailsConfig,
-    model::MockPresence,
     theme::{UiTheme, panel_block_with_theme},
 };
 
@@ -58,22 +57,12 @@ fn contact_details(props: &DetailsProps<'_>, theme: &UiTheme) -> Text<'static> {
             Style::new().fg(theme.muted),
         )));
     };
-    let (presence_label, presence_color) = match contact.presence {
-        MockPresence::Online => ("online", theme.green),
-        MockPresence::Away => ("away", theme.amber),
-        MockPresence::Offline => ("offline", theme.muted),
-    };
-    Text::from(vec![
-        labeled("Name", contact.name.clone(), theme.text, theme.muted),
-        labeled_colored(
-            "Mock presence",
-            presence_label.to_owned(),
-            presence_color,
-            theme.muted,
-        ),
-        labeled("Peer ID", contact.peer_id.clone(), theme.text, theme.muted),
-        labeled("Local note", contact.note.clone(), theme.text, theme.muted),
-    ])
+    Text::from(vec![labeled(
+        "Peer ID",
+        contact.peer_id.as_str().to_owned(),
+        theme.text,
+        theme.muted,
+    )])
 }
 
 fn relay_details(props: &DetailsProps<'_>, theme: &UiTheme) -> Text<'static> {
@@ -141,20 +130,54 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::tui::{TuiApp, action::SidebarTab, config::UiConfig, theme::UiTheme};
+    use crate::{
+        domain::relay::RelaySource,
+        network::identity::peer_id_from_secret,
+        tui::{
+            action::SidebarTab,
+            components::props::DetailsProps,
+            config::UiConfig,
+            model::{ContactView, RelayView},
+            theme::UiTheme,
+        },
+    };
+
+    #[test]
+    fn details_show_the_complete_endpoint_id_without_presence() {
+        let contact = ContactView::from_peer_id(peer_id_for_test(4));
+        let text = render_details_text(
+            DetailsProps {
+                focused: false,
+                tab: SidebarTab::Contacts,
+                contact: Some(&contact),
+                relay: None,
+                scroll: 0,
+            },
+            &UiConfig::default().details,
+            &UiTheme::default(),
+            80,
+            20,
+        );
+        assert!(text.contains(contact.peer_id.as_str()));
+        assert!(!text.contains("presence"));
+    }
 
     #[test]
     fn relay_details_never_claim_a_connection() {
-        let app = TuiApp::demo();
-        let props = crate::tui::components::props::DetailsProps {
-            focused: false,
-            tab: SidebarTab::Relays,
-            contact: None,
-            relay: app.data.relays.first(),
-            scroll: 0,
+        let relay = RelayView {
+            id: 0,
+            url: "https://relay.example.test".into(),
+            source: RelaySource::User,
+            enabled: false,
         };
         let text = render_details_text(
-            props,
+            DetailsProps {
+                focused: false,
+                tab: SidebarTab::Relays,
+                contact: None,
+                relay: Some(&relay),
+                scroll: 0,
+            },
             &UiConfig::default().details,
             &UiTheme::default(),
             36,
@@ -166,8 +189,12 @@ mod tests {
         assert!(!text.contains("Connected"));
     }
 
+    fn peer_id_for_test(byte: u8) -> crate::domain::identity::PeerId {
+        peer_id_from_secret(&iroh::SecretKey::from_bytes(&[byte; 32]))
+    }
+
     fn render_details_text(
-        props: crate::tui::components::props::DetailsProps<'_>,
+        props: DetailsProps<'_>,
         config: &crate::tui::config::DetailsConfig,
         theme: &UiTheme,
         width: u16,
