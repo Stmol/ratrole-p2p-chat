@@ -8,100 +8,114 @@ use ratatui::{
 
 use crate::domain::relay::RelaySource;
 use crate::tui::{
-    action::{Panel, SidebarTab},
-    app::TuiApp,
+    action::SidebarTab,
+    components::props::SidebarProps,
+    config::SidebarConfig,
     model::MockPresence,
-    theme::{AMBER, BLUE, GREEN, MUTED, PANEL, TEXT, panel_block},
+    theme::{UiTheme, panel_block_with_theme},
 };
 
-const CONTENT_PAD_Y: u16 = 1;
-
-pub fn render_sidebar(frame: &mut Frame, area: Rect, app: &TuiApp) {
-    let focused = app.focus == Panel::List;
-    let block = panel_block(" List ", focused);
+pub fn render_sidebar(
+    frame: &mut Frame,
+    area: Rect,
+    props: SidebarProps<'_>,
+    config: &SidebarConfig,
+    theme: &UiTheme,
+) {
+    let block = panel_block_with_theme(theme, " List ", props.focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let [tabs_area, list_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
+        Layout::vertical([Constraint::Length(config.tab_height), Constraint::Min(1)]).areas(inner);
 
     frame.render_widget(
-        Paragraph::new(tab_line(app)).style(Style::new().bg(PANEL)),
+        Paragraph::new(tab_line(&props, theme)).style(Style::new().bg(theme.panel)),
         tabs_area,
     );
     frame.render_widget(
         Block::new()
             .borders(Borders::BOTTOM)
-            .border_style(Style::new().fg(MUTED)),
+            .border_style(Style::new().fg(theme.muted)),
         Rect::new(tabs_area.x, tabs_area.y + 1, tabs_area.width, 1),
     );
 
-    let list_area = padded_vertical(list_area).unwrap_or(list_area);
-    match app.sidebar_tab {
-        SidebarTab::Contacts => render_contacts(frame, list_area, app),
-        SidebarTab::Relays => render_relays(frame, list_area, app),
+    let list_area = padded_vertical(list_area, config.content_padding_y).unwrap_or(list_area);
+    match props.tab {
+        SidebarTab::Contacts => render_contacts(frame, list_area, &props, config, theme),
+        SidebarTab::Relays => render_relays(frame, list_area, &props, config, theme),
     }
 }
 
-fn tab_line(app: &TuiApp) -> Line<'static> {
-    let contacts_style = tab_label_style(app.sidebar_tab == SidebarTab::Contacts);
-    let relays_style = tab_label_style(app.sidebar_tab == SidebarTab::Relays);
+fn tab_line(props: &SidebarProps<'_>, theme: &UiTheme) -> Line<'static> {
+    let contacts_style = tab_label_style(props.tab == SidebarTab::Contacts, theme);
+    let relays_style = tab_label_style(props.tab == SidebarTab::Relays, theme);
 
     Line::from(vec![
         Span::raw(" "),
         Span::styled("Contacts", contacts_style),
-        Span::styled("¹", Style::new().fg(MUTED)),
+        Span::styled("¹", Style::new().fg(theme.muted)),
         Span::raw(" "),
         Span::styled("Relays", relays_style),
-        Span::styled("²", Style::new().fg(MUTED)),
+        Span::styled("²", Style::new().fg(theme.muted)),
     ])
 }
 
-fn tab_label_style(selected: bool) -> Style {
+fn tab_label_style(selected: bool, theme: &UiTheme) -> Style {
     if selected {
-        Style::new().fg(BLUE).add_modifier(Modifier::BOLD)
+        Style::new().fg(theme.blue).add_modifier(Modifier::BOLD)
     } else {
-        Style::new().fg(MUTED)
+        Style::new().fg(theme.muted)
     }
 }
 
-fn render_contacts(frame: &mut Frame, area: Rect, app: &TuiApp) {
-    if app.data.contacts.is_empty() {
+fn render_contacts(
+    frame: &mut Frame,
+    area: Rect,
+    props: &SidebarProps<'_>,
+    config: &SidebarConfig,
+    theme: &UiTheme,
+) {
+    if props.contacts.is_empty() {
         frame.render_widget(
             ratatui::widgets::Paragraph::new("No contacts in this demo")
-                .style(Style::new().fg(MUTED).bg(PANEL)),
+                .style(Style::new().fg(theme.muted).bg(theme.panel)),
             area,
         );
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .data
+    let items: Vec<ListItem> = props
         .contacts
         .iter()
         .map(|contact| {
-            let (dot, color, label) = presence_parts(contact.presence);
+            let (dot, color, label) = presence_parts(contact.presence, config, theme);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{dot} "), Style::new().fg(color)),
-                Span::styled(contact.name.clone(), Style::new().fg(TEXT)),
-                Span::styled(format!(" {label}"), Style::new().fg(MUTED)),
+                Span::styled(contact.name.clone(), Style::new().fg(theme.text)),
+                Span::styled(format!(" {label}"), Style::new().fg(theme.muted)),
             ]))
         })
         .collect();
 
-    render_selectable_list(frame, area, items, app.clamped_contact_index())
+    render_selectable_list(frame, area, items, props.selected, theme)
 }
 
-fn render_relays(frame: &mut Frame, area: Rect, app: &TuiApp) {
-    let items: Vec<ListItem> = app
-        .data
+fn render_relays(
+    frame: &mut Frame,
+    area: Rect,
+    props: &SidebarProps<'_>,
+    config: &SidebarConfig,
+    theme: &UiTheme,
+) {
+    let items: Vec<ListItem> = props
         .relays
         .iter()
         .map(|relay| {
             let (dot, color) = if relay.enabled {
-                ("●", GREEN)
+                (config.active_glyph, theme.green)
             } else {
-                ("○", MUTED)
+                (config.inactive_glyph, theme.muted)
             };
             let source = match relay.source {
                 RelaySource::BuiltIn => "built-in",
@@ -109,20 +123,31 @@ fn render_relays(frame: &mut Frame, area: Rect, app: &TuiApp) {
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{dot} "), Style::new().fg(color)),
-                Span::styled(compact_relay_host(&relay.url), Style::new().fg(TEXT)),
-                Span::styled(format!(" {source}"), Style::new().fg(MUTED)),
+                Span::styled(compact_relay_host(&relay.url), Style::new().fg(theme.text)),
+                Span::styled(format!(" {source}"), Style::new().fg(theme.muted)),
             ]))
         })
         .collect();
 
-    render_selectable_list(frame, area, items, app.clamped_relay_index())
+    render_selectable_list(frame, area, items, props.selected, theme)
 }
 
-fn render_selectable_list(frame: &mut Frame, area: Rect, items: Vec<ListItem>, selected: usize) {
+fn render_selectable_list(
+    frame: &mut Frame,
+    area: Rect,
+    items: Vec<ListItem>,
+    selected: usize,
+    theme: &UiTheme,
+) {
     let item_count = items.len();
     let list = List::new(items)
-        .style(Style::new().fg(TEXT).bg(PANEL))
-        .highlight_style(Style::new().fg(TEXT).bg(BLUE).add_modifier(Modifier::BOLD));
+        .style(Style::new().fg(theme.text).bg(theme.panel))
+        .highlight_style(
+            Style::new()
+                .fg(theme.text)
+                .bg(theme.blue)
+                .add_modifier(Modifier::BOLD),
+        );
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
 
@@ -138,24 +163,28 @@ fn render_selectable_list(frame: &mut Frame, area: Rect, items: Vec<ListItem>, s
     }
 }
 
-fn padded_vertical(area: Rect) -> Option<Rect> {
-    let height = area.height.saturating_sub(CONTENT_PAD_Y.saturating_mul(2));
+fn padded_vertical(area: Rect, padding: u16) -> Option<Rect> {
+    let height = area.height.saturating_sub(padding.saturating_mul(2));
     if height == 0 || area.width == 0 {
         return None;
     }
     Some(Rect::new(
         area.x,
-        area.y.saturating_add(CONTENT_PAD_Y),
+        area.y.saturating_add(padding),
         area.width,
         height,
     ))
 }
 
-fn presence_parts(presence: MockPresence) -> (&'static str, Color, &'static str) {
+fn presence_parts(
+    presence: MockPresence,
+    config: &SidebarConfig,
+    theme: &UiTheme,
+) -> (&'static str, Color, &'static str) {
     match presence {
-        MockPresence::Online => ("●", GREEN, "online"),
-        MockPresence::Away => ("●", AMBER, "away"),
-        MockPresence::Offline => ("○", MUTED, "offline"),
+        MockPresence::Online => (config.active_glyph, theme.green, "online"),
+        MockPresence::Away => (config.active_glyph, theme.amber, "away"),
+        MockPresence::Offline => (config.inactive_glyph, theme.muted, "offline"),
     }
 }
 
@@ -172,11 +201,11 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
-    use crate::tui::action::SidebarTab;
+    use crate::tui::{TuiApp, action::SidebarTab, config::UiConfig, theme::UiTheme};
 
     #[test]
     fn contacts_empty_state_message() {
-        let mut app = TuiApp::new();
+        let mut app = TuiApp::demo();
         app.data.contacts.clear();
         let text = render_sidebar_text(&app, 30, 16);
         assert!(text.contains("No contacts in this demo"));
@@ -184,16 +213,24 @@ mod tests {
 
     #[test]
     fn relays_show_built_in_label() {
-        let mut app = TuiApp::new();
-        app.sidebar_tab = SidebarTab::Relays;
-        let text = render_sidebar_text(&app, 48, 16);
+        let app = TuiApp::demo();
+        let config = UiConfig::default();
+        let props = crate::tui::components::props::SidebarProps {
+            focused: false,
+            tab: SidebarTab::Relays,
+            contacts: &app.data.contacts,
+            relays: &app.data.relays,
+            selected: 0,
+        };
+        let text = render_sidebar_props(props, &config.sidebar, &UiTheme::default(), 48, 16);
         assert!(text.contains("built-in"));
         assert!(text.contains("user"));
     }
 
     #[test]
     fn tabs_join_labels_and_superscript_shortcuts() {
-        let text = render_sidebar_text(&TuiApp::new(), 30, 16);
+        let app = TuiApp::demo();
+        let text = render_sidebar_text(&app, 30, 16);
 
         assert!(text.contains("Contacts¹"));
         assert!(text.contains("Relays²"));
@@ -202,12 +239,20 @@ mod tests {
     #[test]
     fn shortcut_colors_are_muted_for_both_tab_states() {
         for tab in [SidebarTab::Contacts, SidebarTab::Relays] {
-            let mut app = TuiApp::new();
-            app.sidebar_tab = tab;
-            let buffer = render_sidebar_buffer(&app, 30, 16);
+            let app = TuiApp::demo();
+            let mut props = app.sidebar_props();
+            props.tab = tab;
+            let buffer = render_sidebar_props_buffer(
+                props,
+                &UiConfig::default().sidebar,
+                &UiTheme::default(),
+                30,
+                16,
+            );
 
-            assert_eq!(foreground_for_symbol(&buffer, "¹"), Some(MUTED));
-            assert_eq!(foreground_for_symbol(&buffer, "²"), Some(MUTED));
+            let theme = UiTheme::default();
+            assert_eq!(foreground_for_symbol(&buffer, "¹"), Some(theme.muted));
+            assert_eq!(foreground_for_symbol(&buffer, "²"), Some(theme.muted));
         }
     }
 
@@ -219,7 +264,42 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_sidebar(frame, frame.area(), app))
+            .draw(|frame| {
+                render_sidebar(
+                    frame,
+                    frame.area(),
+                    app.sidebar_props(),
+                    &app.config().sidebar,
+                    &app.config().theme,
+                )
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_sidebar_props(
+        props: crate::tui::components::props::SidebarProps<'_>,
+        config: &crate::tui::config::SidebarConfig,
+        theme: &UiTheme,
+        width: u16,
+        height: u16,
+    ) -> String {
+        buffer_to_string(&render_sidebar_props_buffer(
+            props, config, theme, width, height,
+        ))
+    }
+
+    fn render_sidebar_props_buffer(
+        props: crate::tui::components::props::SidebarProps<'_>,
+        config: &crate::tui::config::SidebarConfig,
+        theme: &UiTheme,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_sidebar(frame, frame.area(), props, config, theme))
             .expect("draw");
         terminal.backend().buffer().clone()
     }

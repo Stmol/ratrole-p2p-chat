@@ -1,6 +1,9 @@
 mod action;
 mod app;
+mod component;
 mod components;
+mod config;
+mod demo;
 mod input;
 mod layout;
 mod model;
@@ -51,7 +54,7 @@ pub fn run() -> Result<()> {
 }
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    let mut app = TuiApp::new();
+    let mut app = TuiApp::demo();
     let blink_interval = Duration::from_millis(500);
     let mut next_blink = Instant::now() + blink_interval;
 
@@ -61,7 +64,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()>
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let action = input::action_for_key(&app, key);
+                    let action = input::action_for_key(app.input_context(), key);
                     app.update(action);
                     next_blink = Instant::now() + blink_interval;
                 }

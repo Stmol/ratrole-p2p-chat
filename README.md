@@ -36,6 +36,12 @@ in-memory demo data. Contacts, presence values, relay state, chat history, and
 context-menu changes are not loaded from or written to persistent storage.
 Message submission is deliberately unavailable.
 
+The preview is composed from internal TUI components. `TuiApp` owns demo data
+and applies UI commands, while List, Chat, Details, and modal state stay local
+to their presentation components. Colours, geometry, and component spacing are
+provided by an in-memory `UiConfig` preset when the app is created; Rathole
+does not read a TUI configuration file or switch presets at runtime.
+
 - `Tab` / `Shift+Tab`: cycle List, Chat, and Details
 - `j/k` or arrow keys: select or scroll in the focused panel
 - `h/l` or left/right: switch Contacts and Relays while List is focused

@@ -7,10 +7,11 @@ use ratatui::{
 };
 
 use crate::tui::{
-    action::{ChatMode, Panel},
-    app::TuiApp,
+    action::ChatMode,
+    components::props::ChatProps,
+    config::ChatConfig,
     model::{MessageSender, MessageView},
-    theme::{BLUE, MESSAGE, MUTED, PANEL, TEXT, panel_block},
+    theme::{UiTheme, panel_block_with_theme},
 };
 
 /// Horizontal inset of message/composer cards from the panel edges.
@@ -23,31 +24,31 @@ const CARD_PAD_X: u16 = 2;
 /// Inner vertical padding inside each card.
 const CARD_PAD_Y: u16 = 1;
 /// Blank rows between consecutive message cards.
-const MESSAGE_GAP: u16 = 1;
 /// Composer block height (top pad + draft + bottom pad).
-const COMPOSER_HEIGHT: u16 = 3;
-/// Blank rows between the panel border and chat content.
-const PANEL_PAD_Y: u16 = 1;
-
-pub fn render_chat(frame: &mut Frame, area: Rect, app: &TuiApp) {
-    let focused = app.focus == Panel::Chat;
-    let title = chat_title(app);
-    let block = panel_block(title, focused);
+pub fn render_chat(
+    frame: &mut Frame,
+    area: Rect,
+    props: ChatProps<'_>,
+    config: &ChatConfig,
+    theme: &UiTheme,
+) {
+    let title = chat_title(&props);
+    let block = panel_block_with_theme(theme, title, props.focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Block::new().style(Style::new().bg(PANEL)), inner);
+    frame.render_widget(Block::new().style(Style::new().bg(theme.panel)), inner);
 
-    let Some(contact) = app.active_contact() else {
-        let content = padded_content_area(inner).unwrap_or(inner);
+    let Some(contact) = props.contact else {
+        let content = padded_content_area(inner, config.content_padding_y).unwrap_or(inner);
         frame.render_widget(
             Paragraph::new("Select a contact to start a conversation")
-                .style(Style::new().fg(MUTED).bg(PANEL)),
+                .style(Style::new().fg(theme.muted).bg(theme.panel)),
             content,
         );
         return;
     };
 
-    let Some(content) = padded_content_area(inner) else {
+    let Some(content) = padded_content_area(inner, config.content_padding_y) else {
         return;
     };
 
@@ -55,16 +56,23 @@ pub fn render_chat(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let [transcript, _spacer, composer] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1),
-        Constraint::Length(COMPOSER_HEIGHT),
+        Constraint::Length(config.composer_height),
     ])
     .areas(content);
 
-    render_transcript(frame, transcript, app, contact.name.as_str());
-    render_composer(frame, composer, app);
+    render_transcript(
+        frame,
+        transcript,
+        &props,
+        contact.name.as_str(),
+        config,
+        theme,
+    );
+    render_composer(frame, composer, &props, config, theme);
 }
 
-fn chat_title(app: &TuiApp) -> Line<'static> {
-    match app.active_contact() {
+fn chat_title(props: &ChatProps<'_>) -> Line<'static> {
+    match props.contact {
         Some(contact) => {
             let presence = match contact.presence {
                 crate::tui::model::MockPresence::Online => "mock online",
@@ -77,19 +85,26 @@ fn chat_title(app: &TuiApp) -> Line<'static> {
     }
 }
 
-fn render_transcript(frame: &mut Frame, area: Rect, app: &TuiApp, contact_name: &str) {
-    let messages = app.active_messages();
+fn render_transcript(
+    frame: &mut Frame,
+    area: Rect,
+    props: &ChatProps<'_>,
+    contact_name: &str,
+    config: &ChatConfig,
+    theme: &UiTheme,
+) {
+    let messages = props.messages;
     if messages.is_empty() {
         frame.render_widget(
             Paragraph::new("No messages in this demo conversation")
-                .style(Style::new().fg(MUTED).bg(PANEL)),
+                .style(Style::new().fg(theme.muted).bg(theme.panel)),
             area,
         );
         return;
     }
 
     // scroll_offset = how far up from the newest message (0 = pinned to bottom).
-    let from_bottom = app.chat_scroll_offset().min(messages.len());
+    let from_bottom = props.scroll_offset.min(messages.len());
     let end = messages.len().saturating_sub(from_bottom);
     if end == 0 {
         return;
@@ -111,7 +126,11 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &TuiApp, contact_name: 
             MessageSender::Contact => contact_name,
         };
         let height = message_height(message, author, width);
-        let gap = if used_height == 0 { 0 } else { MESSAGE_GAP };
+        let gap = if used_height == 0 {
+            0
+        } else {
+            config.message_gap
+        };
         if used_height > 0 && used_height.saturating_add(gap).saturating_add(height) > area.height {
             break;
         }
@@ -132,8 +151,8 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &TuiApp, contact_name: 
         }
         let remaining = bottom.saturating_sub(y);
         let rail = match message.sender {
-            MessageSender::Local => BLUE,
-            MessageSender::Contact => MUTED,
+            MessageSender::Local => theme.blue,
+            MessageSender::Contact => theme.muted,
         };
         let author = match message.sender {
             MessageSender::Local => "You",
@@ -146,42 +165,60 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &TuiApp, contact_name: 
         let rail_area = Rect::new(card_area.x, y, RAIL_WIDTH, height);
         let message_area = Rect::new(surface_area.x, y, surface_area.width, height);
         render_rail(frame, rail_area, rail);
-        frame.render_widget(message_card(message, author, rail), message_area);
+        frame.render_widget(message_card(message, author, rail, theme), message_area);
         y = y.saturating_add(height);
 
-        if index + 1 < visible.len() && y.saturating_add(MESSAGE_GAP) <= bottom {
-            y = y.saturating_add(MESSAGE_GAP);
+        if index + 1 < visible.len() && y.saturating_add(config.message_gap) <= bottom {
+            y = y.saturating_add(config.message_gap);
         }
     }
 }
 
-fn render_composer(frame: &mut Frame, area: Rect, app: &TuiApp) {
+fn render_composer(
+    frame: &mut Frame,
+    area: Rect,
+    props: &ChatProps<'_>,
+    config: &ChatConfig,
+    theme: &UiTheme,
+) {
     let Some(card_area) = card_rect(area) else {
         return;
     };
     let Some(surface_area) = card_surface_rect(card_area) else {
         return;
     };
-    let insert = app.focus == Panel::Chat && app.chat_mode == ChatMode::Insert;
-    let rail = if insert { BLUE } else { MUTED };
-    let draft = app.active_draft();
+    let insert = props.focused && props.mode == ChatMode::Insert;
+    let rail = if insert { theme.blue } else { theme.muted };
+    let draft = props.draft;
     let content_width = content_width(surface_area.width);
-    let body = composer_body(app, draft, content_width, insert);
+    let body = composer_body(props, draft, content_width, insert, config, theme);
     let block = Block::new()
-        .style(Style::new().bg(MESSAGE))
-        .padding(card_padding());
+        .style(Style::new().bg(theme.message))
+        .padding(Padding::new(
+            config.content_padding_x,
+            config.content_padding_x,
+            1,
+            1,
+        ));
     let rail_area = Rect::new(card_area.x, card_area.y, RAIL_WIDTH, card_area.height);
     render_rail(frame, rail_area, rail);
     frame.render_widget(
         Paragraph::new(body)
-            .style(Style::new().bg(MESSAGE))
+            .style(Style::new().bg(theme.message))
             .wrap(Wrap { trim: false })
             .block(block),
         surface_area,
     );
 }
 
-fn composer_body(app: &TuiApp, draft: &str, width: usize, insert: bool) -> Line<'static> {
+fn composer_body(
+    props: &ChatProps<'_>,
+    draft: &str,
+    width: usize,
+    insert: bool,
+    config: &ChatConfig,
+    theme: &UiTheme,
+) -> Line<'static> {
     if !insert {
         let body = if draft.is_empty() {
             "Type a message…".to_owned()
@@ -189,33 +226,33 @@ fn composer_body(app: &TuiApp, draft: &str, width: usize, insert: bool) -> Line<
             crop_draft_left(draft, width)
         };
         let style = if draft.is_empty() {
-            Style::new().fg(MUTED)
+            Style::new().fg(theme.muted)
         } else {
-            Style::new().fg(TEXT)
+            Style::new().fg(theme.text)
         };
         return Line::from(Span::styled(body, style));
     }
 
     let characters: Vec<char> = draft.chars().collect();
-    let cursor = app.active_draft_cursor().min(characters.len());
+    let cursor = props.cursor.min(characters.len());
     let start = cursor.saturating_sub(width.saturating_sub(1));
     let end = start.saturating_add(width).min(characters.len());
     let before: String = characters[start..cursor].iter().collect();
     let cursor_cell = characters
         .get(cursor)
         .map(char::to_string)
-        .unwrap_or_else(|| " ".to_owned());
+        .unwrap_or_else(|| config.cursor_glyph.to_owned());
     let after_start = cursor.saturating_add(1).min(end);
     let after: String = characters[after_start..end].iter().collect();
-    let cursor_style = if app.cursor_visible {
-        Style::new().fg(MESSAGE).bg(BLUE)
+    let cursor_style = if props.cursor_visible {
+        Style::new().fg(theme.message).bg(theme.blue)
     } else {
-        Style::new().fg(TEXT)
+        Style::new().fg(theme.text)
     };
     Line::from(vec![
-        Span::styled(before, Style::new().fg(TEXT)),
+        Span::styled(before, Style::new().fg(theme.text)),
         Span::styled(cursor_cell, cursor_style),
-        Span::styled(after, Style::new().fg(TEXT)),
+        Span::styled(after, Style::new().fg(theme.text)),
     ])
 }
 
@@ -223,18 +260,22 @@ fn message_card<'a>(
     message: &'a MessageView,
     author: &str,
     rail: ratatui::style::Color,
+    theme: &UiTheme,
 ) -> Paragraph<'a> {
     let block = Block::new()
-        .style(Style::new().fg(TEXT).bg(MESSAGE))
+        .style(Style::new().fg(theme.text).bg(theme.message))
         .padding(card_padding());
     Paragraph::new(Text::from(vec![
         Line::from(message.body.as_str()),
         Line::from(vec![
             Span::styled(author.to_owned(), Style::new().fg(rail).bold()),
-            Span::styled(format!(" · {}", message.timestamp), Style::new().fg(MUTED)),
+            Span::styled(
+                format!(" · {}", message.timestamp),
+                Style::new().fg(theme.muted),
+            ),
         ]),
     ]))
-    .style(Style::new().fg(TEXT).bg(MESSAGE))
+    .style(Style::new().fg(theme.text).bg(theme.message))
     .wrap(Wrap { trim: false })
     .block(block)
 }
@@ -248,14 +289,14 @@ fn card_padding() -> Padding {
     Padding::new(CARD_PAD_X, CARD_PAD_X, CARD_PAD_Y, CARD_PAD_Y)
 }
 
-fn padded_content_area(area: Rect) -> Option<Rect> {
-    let height = area.height.saturating_sub(PANEL_PAD_Y.saturating_mul(2));
+fn padded_content_area(area: Rect, padding: u16) -> Option<Rect> {
+    let height = area.height.saturating_sub(padding.saturating_mul(2));
     if height == 0 || area.width == 0 {
         return None;
     }
     Some(Rect::new(
         area.x,
-        area.y.saturating_add(PANEL_PAD_Y),
+        area.y.saturating_add(padding),
         area.width,
         height,
     ))
@@ -328,20 +369,26 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, style::Color};
 
     use super::*;
-    use crate::tui::theme::{BLUE, MESSAGE, MUTED};
+    use crate::tui::{
+        TuiApp,
+        action::{Action, Panel},
+        config::UiConfig,
+        theme::UiTheme,
+    };
 
     #[test]
     fn chat_renders_box_drawing_rails_with_matching_gaps_for_both_senders() {
-        let app = TuiApp::new();
+        let app = TuiApp::demo();
         let buffer = render_chat_to_buffer(&app, 70, 20);
+        let theme = UiTheme::default();
 
-        assert_rail_and_surface_touch(&buffer, "Mira Chen", MUTED);
-        assert_rail_and_surface_touch(&buffer, "You", BLUE);
+        assert_rail_and_surface_touch(&buffer, "Mira Chen", theme.muted, theme.message);
+        assert_rail_and_surface_touch(&buffer, "You", theme.blue, theme.message);
     }
 
     #[test]
     fn chat_pins_messages_to_the_bottom() {
-        let app = TuiApp::new();
+        let app = TuiApp::demo();
         let buffer = render_chat_to_buffer(&app, 70, 24);
 
         let you_row = row_containing(&buffer, "You");
@@ -353,7 +400,7 @@ mod tests {
 
     #[test]
     fn chat_uses_single_row_gap_between_messages() {
-        let app = TuiApp::new();
+        let app = TuiApp::demo();
         let buffer = render_chat_to_buffer(&app, 70, 24);
 
         let mira_body = row_containing(&buffer, "The demo link is ready");
@@ -374,7 +421,7 @@ mod tests {
 
     #[test]
     fn chat_separates_composer_with_blank_row() {
-        let app = TuiApp::new();
+        let app = TuiApp::demo();
         let buffer = render_chat_to_buffer(&app, 70, 24);
 
         let you_row = row_containing(&buffer, "You · 21:07");
@@ -396,17 +443,18 @@ mod tests {
 
     #[test]
     fn composer_shows_a_highlighted_cursor_in_insert_mode() {
-        let mut app = TuiApp::new();
+        let mut app = TuiApp::demo();
         app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
-        app.update(crate::tui::action::Action::InsertChar('a'));
-        app.update(crate::tui::action::Action::MoveCursor(-1));
+        app.update(Action::EnterInsert);
+        app.update(Action::InsertChar('a'));
+        app.update(Action::MoveCursor(-1));
         let buffer = render_chat_to_buffer(&app, 70, 24);
+        let theme = UiTheme::default();
 
         let cursor = (0..buffer.area.height)
             .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
             .find(|&(x, y)| {
-                buffer[(x, y)].symbol() == "a" && buffer[(x, y)].style().bg == Some(BLUE)
+                buffer[(x, y)].symbol() == "a" && buffer[(x, y)].style().bg == Some(theme.blue)
             });
         assert!(
             cursor.is_some(),
@@ -416,16 +464,17 @@ mod tests {
 
     #[test]
     fn empty_insert_composer_renders_a_cursor_without_panicking() {
-        let mut app = TuiApp::new();
+        let mut app = TuiApp::demo();
         app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
+        app.update(Action::EnterInsert);
 
         let buffer = render_chat_to_buffer(&app, 70, 24);
+        let theme = UiTheme::default();
         assert!(
             buffer
                 .content()
                 .iter()
-                .any(|cell| cell.style().bg == Some(BLUE))
+                .any(|cell| cell.style().bg == Some(theme.blue))
         );
     }
 
@@ -433,12 +482,21 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|frame| render_chat(frame, frame.area(), app))
+            .draw(|frame| {
+                let config = UiConfig::default();
+                let theme = UiTheme::default();
+                render_chat(frame, frame.area(), app.chat_props(), &config.chat, &theme)
+            })
             .expect("draw");
         terminal.backend().buffer().clone()
     }
 
-    fn assert_rail_and_surface_touch(buffer: &ratatui::buffer::Buffer, needle: &str, color: Color) {
+    fn assert_rail_and_surface_touch(
+        buffer: &ratatui::buffer::Buffer,
+        needle: &str,
+        color: Color,
+        message_color: Color,
+    ) {
         for y in 0..buffer.area.height {
             let mut row = String::new();
             for x in 0..buffer.area.width {
@@ -454,7 +512,7 @@ mod tests {
                 };
                 assert_eq!(buffer[(rail_cell, y)].style().fg, Some(color),);
                 let rail_end = rail_cell.saturating_add(RAIL_WIDTH);
-                assert_eq!(buffer[(rail_end, y)].style().bg, Some(MESSAGE),);
+                assert_eq!(buffer[(rail_end, y)].style().bg, Some(message_color),);
                 return;
             }
         }

@@ -1,8 +1,10 @@
 mod chat;
 mod details;
 mod footer;
-mod overlay;
+pub(crate) mod overlay;
+pub(crate) mod props;
 mod sidebar;
+pub(crate) mod state;
 
 pub use chat::render_chat;
 pub use details::render_details;

@@ -2,10 +2,48 @@ use ratatui::layout::{Constraint, Layout, Rect};
 
 use super::action::Panel;
 
-pub const MIN_WIDTH: u16 = 40;
-pub const MIN_HEIGHT: u16 = 12;
-pub const WIDE_WIDTH: u16 = 120;
-pub const MEDIUM_WIDTH: u16 = 80;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LayoutSpec {
+    pub min_width: u16,
+    pub min_height: u16,
+    pub wide_width: u16,
+    pub medium_width: u16,
+    pub sidebar_width: u16,
+    pub chat_min_width: u16,
+    pub details_width: u16,
+    pub footer_height: u16,
+}
+
+#[allow(dead_code)]
+impl LayoutSpec {
+    pub(crate) fn compact() -> Self {
+        Self {
+            min_width: 32,
+            min_height: 10,
+            wide_width: 100,
+            medium_width: 64,
+            sidebar_width: 24,
+            chat_min_width: 32,
+            details_width: 28,
+            footer_height: 1,
+        }
+    }
+}
+
+impl Default for LayoutSpec {
+    fn default() -> Self {
+        Self {
+            min_width: 40,
+            min_height: 12,
+            wide_width: 120,
+            medium_width: 80,
+            sidebar_width: 30,
+            chat_min_width: 48,
+            details_width: 34,
+            footer_height: 1,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutMode {
@@ -24,8 +62,13 @@ pub struct AppLayout {
     pub footer: Option<Rect>,
 }
 
+#[allow(dead_code)]
 pub fn calculate_layout(area: Rect, focus: Panel) -> AppLayout {
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+    calculate_layout_with_spec(area, focus, &LayoutSpec::default())
+}
+
+pub(crate) fn calculate_layout_with_spec(area: Rect, focus: Panel, spec: &LayoutSpec) -> AppLayout {
+    if area.width < spec.min_width || area.height < spec.min_height {
         return AppLayout {
             mode: LayoutMode::TooSmall,
             list: None,
@@ -35,13 +78,14 @@ pub fn calculate_layout(area: Rect, focus: Panel) -> AppLayout {
         };
     }
 
-    let [body, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(spec.footer_height)]).areas(area);
 
-    if area.width >= WIDE_WIDTH {
+    if area.width >= spec.wide_width {
         let [list, chat, details] = Layout::horizontal([
-            Constraint::Length(30),
-            Constraint::Min(48),
-            Constraint::Length(34),
+            Constraint::Length(spec.sidebar_width),
+            Constraint::Min(spec.chat_min_width),
+            Constraint::Length(spec.details_width),
         ])
         .areas(body);
         return AppLayout {
@@ -53,10 +97,13 @@ pub fn calculate_layout(area: Rect, focus: Panel) -> AppLayout {
         };
     }
 
-    if area.width >= MEDIUM_WIDTH {
+    if area.width >= spec.medium_width {
         if focus == Panel::Details {
-            let [chat, details] =
-                Layout::horizontal([Constraint::Min(40), Constraint::Length(34)]).areas(body);
+            let [chat, details] = Layout::horizontal([
+                Constraint::Min(spec.chat_min_width),
+                Constraint::Length(spec.details_width),
+            ])
+            .areas(body);
             return AppLayout {
                 mode: LayoutMode::Medium,
                 list: None,
@@ -65,8 +112,11 @@ pub fn calculate_layout(area: Rect, focus: Panel) -> AppLayout {
                 footer: Some(footer),
             };
         }
-        let [list, chat] =
-            Layout::horizontal([Constraint::Length(30), Constraint::Min(40)]).areas(body);
+        let [list, chat] = Layout::horizontal([
+            Constraint::Length(spec.sidebar_width),
+            Constraint::Min(spec.chat_min_width),
+        ])
+        .areas(body);
         return AppLayout {
             mode: LayoutMode::Medium,
             list: Some(list),
@@ -130,5 +180,27 @@ mod tests {
         let layout = calculate_layout(Rect::new(0, 0, 39, 11), Panel::List);
         assert_eq!(layout.mode, LayoutMode::TooSmall);
         assert!(layout.footer.is_none());
+    }
+
+    #[test]
+    fn default_spec_preserves_existing_breakpoints() {
+        let spec = LayoutSpec::default();
+
+        assert_eq!(spec.min_width, 40);
+        assert_eq!(spec.min_height, 12);
+        assert_eq!(spec.medium_width, 80);
+        assert_eq!(spec.wide_width, 120);
+    }
+
+    #[test]
+    fn compact_spec_enables_more_panels_at_smaller_width() {
+        let area = Rect::new(0, 0, 104, 24);
+
+        let default_layout = calculate_layout_with_spec(area, Panel::List, &LayoutSpec::default());
+        let compact_layout = calculate_layout_with_spec(area, Panel::List, &LayoutSpec::compact());
+
+        assert_eq!(default_layout.mode, LayoutMode::Medium);
+        assert_eq!(compact_layout.mode, LayoutMode::Wide);
+        assert!(compact_layout.details.is_some());
     }
 }

@@ -2,17 +2,17 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::{
     action::{Action, ChatMode, Panel, SidebarTab},
-    app::TuiApp,
+    components::props::InputContext,
 };
 
-pub fn action_for_key(app: &TuiApp, key: KeyEvent) -> Action {
+pub fn action_for_key(context: InputContext, key: KeyEvent) -> Action {
     if key.kind != KeyEventKind::Press {
         return Action::Noop;
     }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Action::Quit;
     }
-    if app.overlay.is_some() {
+    if context.overlay_open {
         return overlay_action(key);
     }
     match key.code {
@@ -20,7 +20,7 @@ pub fn action_for_key(app: &TuiApp, key: KeyEvent) -> Action {
         KeyCode::BackTab => return Action::FocusPrevious,
         _ => {}
     }
-    if app.focus == Panel::Chat && app.chat_mode == ChatMode::Insert {
+    if context.focus == Panel::Chat && context.chat_mode == ChatMode::Insert {
         return insert_action(key);
     }
     match key.code {
@@ -28,7 +28,7 @@ pub fn action_for_key(app: &TuiApp, key: KeyEvent) -> Action {
         KeyCode::Char('2') => return Action::SelectSidebarTab(SidebarTab::Relays),
         _ => {}
     }
-    normal_action(app, key)
+    normal_action(context, key)
 }
 
 fn overlay_action(key: KeyEvent) -> Action {
@@ -64,7 +64,7 @@ fn insert_action(key: KeyEvent) -> Action {
     }
 }
 
-fn normal_action(app: &TuiApp, key: KeyEvent) -> Action {
+fn normal_action(context: InputContext, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('q') => return Action::Quit,
         KeyCode::Char('x') => return Action::OpenContextMenu,
@@ -72,7 +72,7 @@ fn normal_action(app: &TuiApp, key: KeyEvent) -> Action {
         _ => {}
     }
 
-    match app.focus {
+    match context.focus {
         Panel::List => match key.code {
             KeyCode::Char('j') | KeyCode::Down => Action::Navigate(1),
             KeyCode::Char('k') | KeyCode::Up => Action::Navigate(-1),
@@ -104,6 +104,7 @@ mod tests {
 
     use super::*;
     use crate::tui::action::{Action, ChatMode, Panel, SidebarTab};
+    use crate::tui::components::props::InputContext;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -111,139 +112,168 @@ mod tests {
 
     #[test]
     fn x_opens_context_in_chat_normal_mode() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
+        let context = InputContext {
+            focus: Panel::Chat,
+            chat_mode: ChatMode::Normal,
+            overlay_open: false,
+        };
 
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Char('x'))),
+            action_for_key(context, key(KeyCode::Char('x'))),
             Action::OpenContextMenu
         );
     }
 
     #[test]
     fn x_is_text_in_chat_insert_mode() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
+        let context = InputContext {
+            focus: Panel::Chat,
+            chat_mode: ChatMode::Insert,
+            overlay_open: false,
+        };
 
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Char('x'))),
+            action_for_key(context, key(KeyCode::Char('x'))),
             Action::InsertChar('x')
         );
     }
 
     #[test]
     fn tab_remains_global_in_insert_mode() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
+        let context = InputContext {
+            focus: Panel::Chat,
+            chat_mode: ChatMode::Insert,
+            overlay_open: false,
+        };
 
-        assert_eq!(action_for_key(&app, key(KeyCode::Tab)), Action::FocusNext);
+        assert_eq!(
+            action_for_key(context, key(KeyCode::Tab)),
+            Action::FocusNext
+        );
     }
 
     #[test]
     fn number_keys_select_sidebar_tabs_in_normal_mode() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Details;
+        let context = InputContext {
+            focus: Panel::Details,
+            chat_mode: ChatMode::Normal,
+            overlay_open: false,
+        };
 
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Char('1'))),
+            action_for_key(context, key(KeyCode::Char('1'))),
             Action::SelectSidebarTab(SidebarTab::Contacts)
         );
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Char('2'))),
+            action_for_key(context, key(KeyCode::Char('2'))),
             Action::SelectSidebarTab(SidebarTab::Relays)
         );
     }
 
     #[test]
     fn h_l_and_arrow_keys_switch_sidebar_tabs_while_list_is_focused() {
-        let app = TuiApp::new();
+        let context = InputContext {
+            focus: Panel::List,
+            chat_mode: ChatMode::Normal,
+            overlay_open: false,
+        };
 
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Char('h'))),
+            action_for_key(context, key(KeyCode::Char('h'))),
             Action::SelectSidebarTab(SidebarTab::Contacts)
         );
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Left)),
+            action_for_key(context, key(KeyCode::Left)),
             Action::SelectSidebarTab(SidebarTab::Contacts)
         );
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Char('l'))),
+            action_for_key(context, key(KeyCode::Char('l'))),
             Action::SelectSidebarTab(SidebarTab::Relays)
         );
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Right)),
+            action_for_key(context, key(KeyCode::Right)),
             Action::SelectSidebarTab(SidebarTab::Relays)
         );
     }
 
     #[test]
     fn number_keys_remain_text_in_chat_insert_mode() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
+        let context = InputContext {
+            focus: Panel::Chat,
+            chat_mode: ChatMode::Insert,
+            overlay_open: false,
+        };
 
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Char('1'))),
+            action_for_key(context, key(KeyCode::Char('1'))),
             Action::InsertChar('1')
         );
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Char('2'))),
+            action_for_key(context, key(KeyCode::Char('2'))),
             Action::InsertChar('2')
         );
     }
 
     #[test]
     fn cursor_navigation_keys_edit_the_draft_position_in_insert_mode() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
+        let context = InputContext {
+            focus: Panel::Chat,
+            chat_mode: ChatMode::Insert,
+            overlay_open: false,
+        };
 
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Left)),
+            action_for_key(context, key(KeyCode::Left)),
             Action::MoveCursor(-1)
         );
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Right)),
+            action_for_key(context, key(KeyCode::Right)),
             Action::MoveCursor(1)
         );
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Home)),
+            action_for_key(context, key(KeyCode::Home)),
             Action::MoveCursorToStart
         );
         assert_eq!(
-            action_for_key(&app, key(KeyCode::End)),
+            action_for_key(context, key(KeyCode::End)),
             Action::MoveCursorToEnd
         );
-        assert_eq!(action_for_key(&app, key(KeyCode::Delete)), Action::Delete);
+        assert_eq!(
+            action_for_key(context, key(KeyCode::Delete)),
+            Action::Delete
+        );
     }
 
     #[test]
     fn enter_and_shift_enter_submit_the_draft_in_chat_insert_mode() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
+        let context = InputContext {
+            focus: Panel::Chat,
+            chat_mode: ChatMode::Insert,
+            overlay_open: false,
+        };
 
         assert_eq!(
-            action_for_key(&app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            action_for_key(context, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
             Action::SubmitDraft
         );
         assert_eq!(
-            action_for_key(&app, key(KeyCode::Enter)),
+            action_for_key(context, key(KeyCode::Enter)),
             Action::SubmitDraft
         );
     }
 
     #[test]
     fn modal_overlay_traps_tab_but_not_control_c() {
-        let mut app = TuiApp::new();
-        app.update(Action::OpenContextMenu);
+        let context = InputContext {
+            focus: Panel::List,
+            chat_mode: ChatMode::Normal,
+            overlay_open: true,
+        };
 
-        assert_eq!(action_for_key(&app, key(KeyCode::Tab)), Action::Noop);
+        assert_eq!(action_for_key(context, key(KeyCode::Tab)), Action::Noop);
         assert_eq!(
             action_for_key(
-                &app,
+                context,
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
             ),
             Action::Quit

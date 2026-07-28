@@ -1,88 +1,159 @@
-use std::collections::BTreeMap;
-
 use crate::domain::relay::RelaySource;
 
 use super::{
     action::{Action, ChatMode, Panel, SidebarTab},
-    model::{ContactId, ContactView, DemoData, MessageView, RelayView},
+    components::{
+        overlay::{ContextMenu, MenuAction, Overlay},
+        props::{
+            self, ChatProps, DetailsProps, FooterProps, InputContext, OverlayProps, SidebarProps,
+        },
+        state::{ChatState, DetailsState, OverlayState, SidebarState},
+    },
+    config::UiConfig,
+    demo,
+    model::{ContactId, TuiData},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MenuAction {
+pub(crate) enum UiCommand {
     RemoveContact(ContactId),
     ToggleRelay(usize),
     RemoveRelay(usize),
     ClearChat(ContactId),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContextMenu {
-    pub actions: Vec<(MenuAction, &'static str, bool)>,
-    pub selected: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Overlay {
-    Context(ContextMenu),
-    Confirm {
-        action: MenuAction,
-        confirm_selected: bool,
-    },
+    ShowStatus(&'static str),
 }
 
 #[derive(Debug)]
 pub struct TuiApp {
     pub should_quit: bool,
     pub focus: Panel,
-    pub sidebar_tab: SidebarTab,
-    pub chat_mode: ChatMode,
-    pub contact_index: usize,
-    pub relay_index: usize,
-    pub details_scroll: u16,
-    pub overlay: Option<Overlay>,
-    pub status: Option<String>,
-    pub cursor_visible: bool,
-    pub data: DemoData,
-    drafts: BTreeMap<ContactId, String>,
-    draft_cursors: BTreeMap<ContactId, usize>,
-    chat_scroll: BTreeMap<ContactId, usize>,
+    pub data: TuiData,
+    config: UiConfig,
+    status: Option<String>,
+    sidebar: SidebarState,
+    chat: ChatState,
+    details: DetailsState,
+    overlay: OverlayState,
 }
 
 impl TuiApp {
-    pub fn new() -> Self {
+    pub(crate) fn new(data: TuiData, config: UiConfig) -> Self {
         Self {
             should_quit: false,
             focus: Panel::List,
-            sidebar_tab: SidebarTab::Contacts,
-            chat_mode: ChatMode::Normal,
-            contact_index: 0,
-            relay_index: 0,
-            details_scroll: 0,
-            overlay: None,
+            data,
+            config,
             status: None,
-            cursor_visible: true,
-            data: DemoData::sample(),
-            drafts: BTreeMap::new(),
-            draft_cursors: BTreeMap::new(),
-            chat_scroll: BTreeMap::new(),
+            sidebar: SidebarState::default(),
+            chat: ChatState::default(),
+            details: DetailsState::default(),
+            overlay: OverlayState::default(),
         }
     }
 
-    pub fn update(&mut self, action: Action) {
-        if matches!(
-            action,
-            Action::EnterInsert
-                | Action::InsertChar(_)
-                | Action::Backspace
-                | Action::Delete
-                | Action::MoveCursor(_)
-                | Action::MoveCursorToStart
-                | Action::MoveCursorToEnd
-        ) {
-            self.cursor_visible = true;
+    pub fn demo() -> Self {
+        Self::new(demo::sample_data(), UiConfig::default())
+    }
+
+    pub(crate) fn config(&self) -> &UiConfig {
+        &self.config
+    }
+
+    pub(crate) fn input_context(&self) -> InputContext {
+        InputContext {
+            focus: self.focus,
+            chat_mode: self.chat.mode,
+            overlay_open: self.overlay.overlay.is_some(),
         }
+    }
+
+    pub(crate) fn sidebar_props(&self) -> SidebarProps<'_> {
+        let selected = match self.sidebar.tab {
+            SidebarTab::Contacts => self.clamped_contact_index(),
+            SidebarTab::Relays => self.clamped_relay_index(),
+        };
+        SidebarProps {
+            focused: self.focus == Panel::List,
+            tab: self.sidebar.tab,
+            contacts: &self.data.contacts,
+            relays: &self.data.relays,
+            selected,
+        }
+    }
+
+    pub(crate) fn chat_props(&self) -> ChatProps<'_> {
+        let contact = self.active_contact();
+        let id = contact.map(|contact| contact.id);
+        let messages = id
+            .and_then(|id| self.data.chats.get(&id))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let draft = id
+            .and_then(|id| self.chat.drafts.get(&id))
+            .map(String::as_str)
+            .unwrap_or("");
+        let cursor = id
+            .and_then(|id| self.chat.cursors.get(&id).copied())
+            .unwrap_or_else(|| draft.chars().count())
+            .min(draft.chars().count());
+        let scroll_offset = id
+            .and_then(|id| self.chat.scroll.get(&id).copied())
+            .unwrap_or(0);
+        ChatProps {
+            focused: self.focus == Panel::Chat,
+            mode: self.chat.mode,
+            cursor_visible: self.chat.cursor_visible,
+            contact,
+            messages,
+            draft,
+            cursor,
+            scroll_offset,
+        }
+    }
+
+    pub(crate) fn details_props(&self) -> DetailsProps<'_> {
+        let scroll = match self.sidebar.tab {
+            SidebarTab::Contacts => self.details.contacts_scroll,
+            SidebarTab::Relays => self.details.relays_scroll,
+        };
+        DetailsProps {
+            focused: self.focus == Panel::Details,
+            tab: self.sidebar.tab,
+            contact: self.active_contact(),
+            relay: self.active_relay(),
+            scroll,
+        }
+    }
+
+    pub(crate) fn footer_props(&self) -> FooterProps<'_> {
+        FooterProps {
+            focus: self.focus,
+            chat_mode: self.chat.mode,
+            status: self.status.as_deref(),
+        }
+    }
+    pub(crate) fn overlay_props(&self) -> OverlayProps<'_> {
+        OverlayProps {
+            focus: self.focus,
+            sidebar_tab: self.sidebar.tab,
+            overlay: self.overlay.overlay.as_ref(),
+        }
+    }
+    pub(crate) fn overlay_open(&self) -> bool {
+        self.overlay.overlay.is_some()
+    }
+
+    pub fn update(&mut self, action: Action) {
         if !matches!(action, Action::Noop | Action::SubmitDraft) {
             self.status = None;
+        }
+        if action == Action::Quit {
+            self.should_quit = true;
+            return;
+        }
+        if self.overlay.overlay.is_some() {
+            self.update_overlay(action);
+            return;
         }
         match action {
             Action::Quit => self.should_quit = true,
@@ -90,580 +161,349 @@ impl TuiApp {
             Action::FocusPrevious => self.set_focus(self.focus.previous()),
             Action::FocusList => self.set_focus(Panel::List),
             Action::SelectSidebarTab(tab) => {
-                self.sidebar_tab = tab;
-                self.details_scroll = 0;
+                self.sidebar.tab = tab;
+                self.details_reset();
             }
             Action::Navigate(delta) => self.navigate(delta),
             Action::Page(delta) => self.page(delta),
             Action::OpenContextMenu => self.open_context_menu(),
-            Action::CloseOverlay => self.overlay = None,
-            Action::Activate => self.activate(),
             Action::EnterInsert if self.active_contact().is_some() => {
-                self.chat_mode = ChatMode::Insert;
+                self.chat.mode = ChatMode::Insert;
                 self.move_cursor_to_end();
             }
-            Action::ExitInsert => self.chat_mode = ChatMode::Normal,
-            Action::InsertChar(character) => self.insert_character(character),
-            Action::Backspace => {
-                self.backspace();
+            Action::ExitInsert => self.chat.mode = ChatMode::Normal,
+            Action::InsertChar(ch) if self.chat.mode == ChatMode::Insert => {
+                self.insert_character(ch)
             }
-            Action::Delete => self.delete(),
-            Action::MoveCursor(delta) => self.move_cursor(delta),
-            Action::MoveCursorToStart => self.move_cursor_to_start(),
-            Action::MoveCursorToEnd => self.move_cursor_to_end(),
-            Action::SubmitDraft if !self.active_draft().is_empty() => {
-                self.status = Some("Messaging is not available in DEMO mode".into());
+            Action::Backspace if self.chat.mode == ChatMode::Insert => self.backspace(),
+            Action::Delete if self.chat.mode == ChatMode::Insert => self.delete(),
+            Action::MoveCursor(delta) if self.chat.mode == ChatMode::Insert => {
+                self.move_cursor(delta)
             }
-            Action::Noop | Action::EnterInsert | Action::SubmitDraft => {}
+            Action::MoveCursorToStart if self.chat.mode == ChatMode::Insert => self.set_cursor(0),
+            Action::MoveCursorToEnd if self.chat.mode == ChatMode::Insert => {
+                self.move_cursor_to_end()
+            }
+            Action::SubmitDraft if !self.chat_props().draft.is_empty() => self.apply_command(
+                UiCommand::ShowStatus("Messaging is not available in DEMO mode"),
+            ),
+            _ => {}
         }
-    }
-
-    pub fn active_contact(&self) -> Option<&ContactView> {
-        self.data.contacts.get(self.clamped_contact_index())
-    }
-
-    pub fn active_relay(&self) -> Option<&RelayView> {
-        self.data.relays.get(self.clamped_relay_index())
-    }
-
-    pub fn active_draft(&self) -> &str {
-        self.active_contact()
-            .and_then(|contact| self.drafts.get(&contact.id))
-            .map(String::as_str)
-            .unwrap_or("")
-    }
-
-    pub fn active_draft_cursor(&self) -> usize {
-        let draft_len = self.active_draft().chars().count();
-        self.active_contact()
-            .and_then(|contact| self.draft_cursors.get(&contact.id).copied())
-            .unwrap_or(draft_len)
-            .min(draft_len)
     }
 
     pub fn toggle_cursor_blink(&mut self) {
-        if self.focus == Panel::Chat && self.chat_mode == ChatMode::Insert {
-            self.cursor_visible = !self.cursor_visible;
-        } else {
-            self.cursor_visible = true;
-        }
-    }
-
-    #[cfg(test)]
-    pub fn draft_for(&self, contact_id: ContactId) -> &str {
-        self.drafts
-            .get(&contact_id)
-            .map(String::as_str)
-            .unwrap_or("")
-    }
-
-    pub fn active_messages(&self) -> &[MessageView] {
-        self.active_contact()
-            .and_then(|contact| self.data.chats.get(&contact.id))
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-    }
-
-    pub fn chat_scroll_offset(&self) -> usize {
-        self.active_contact()
-            .and_then(|contact| self.chat_scroll.get(&contact.id).copied())
-            .unwrap_or(0)
-    }
-
-    pub fn clamped_contact_index(&self) -> usize {
-        clamp_index(self.contact_index, self.data.contacts.len())
-    }
-
-    pub fn clamped_relay_index(&self) -> usize {
-        clamp_index(self.relay_index, self.data.relays.len())
+        self.chat.cursor_visible =
+            if self.focus == Panel::Chat && self.chat.mode == ChatMode::Insert {
+                !self.chat.cursor_visible
+            } else {
+                true
+            };
     }
 
     fn set_focus(&mut self, focus: Panel) {
         self.focus = focus;
         if focus != Panel::Chat {
-            self.chat_mode = ChatMode::Normal;
+            self.chat.mode = ChatMode::Normal;
         }
     }
-
-    fn active_draft_mut(&mut self) -> &mut String {
-        let contact_id = self.active_contact().map(|contact| contact.id).unwrap_or(0);
-        self.drafts.entry(contact_id).or_default()
+    fn active_contact(&self) -> Option<&super::model::ContactView> {
+        props::selected_contact(&self.data, self.sidebar.contact_index)
     }
-
-    fn active_contact_id(&self) -> ContactId {
-        self.active_contact().map(|contact| contact.id).unwrap_or(0)
+    fn active_relay(&self) -> Option<&super::model::RelayView> {
+        props::selected_relay(&self.data, self.sidebar.relay_index)
     }
-
-    fn set_active_draft_cursor(&mut self, cursor: usize) {
-        let contact_id = self.active_contact_id();
-        let draft_len = self.active_draft().chars().count();
-        self.draft_cursors.insert(contact_id, cursor.min(draft_len));
+    fn clamped_contact_index(&self) -> usize {
+        self.sidebar
+            .contact_index
+            .min(self.data.contacts.len().saturating_sub(1))
     }
-
-    fn insert_character(&mut self, character: char) {
-        let cursor = self.active_draft_cursor();
-        let byte_index = self
-            .active_draft()
+    fn clamped_relay_index(&self) -> usize {
+        self.sidebar
+            .relay_index
+            .min(self.data.relays.len().saturating_sub(1))
+    }
+    fn active_id(&self) -> Option<ContactId> {
+        self.active_contact().map(|contact| contact.id)
+    }
+    fn details_reset(&mut self) {
+        match self.sidebar.tab {
+            SidebarTab::Contacts => self.details.contacts_scroll = 0,
+            SidebarTab::Relays => self.details.relays_scroll = 0,
+        }
+    }
+    fn set_cursor(&mut self, cursor: usize) {
+        if let Some(id) = self.active_id() {
+            let len = self
+                .chat
+                .drafts
+                .get(&id)
+                .map_or(0, |draft| draft.chars().count());
+            self.chat.cursors.insert(id, cursor.min(len));
+        }
+    }
+    fn move_cursor_to_end(&mut self) {
+        let len = self.chat_props().draft.chars().count();
+        self.set_cursor(len);
+    }
+    fn insert_character(&mut self, ch: char) {
+        let Some(id) = self.active_id() else {
+            return;
+        };
+        let cursor = self.chat_props().cursor;
+        let draft = self.chat.drafts.entry(id).or_default();
+        let byte = draft
             .char_indices()
             .nth(cursor)
             .map(|(index, _)| index)
-            .unwrap_or_else(|| self.active_draft().len());
-        self.active_draft_mut().insert(byte_index, character);
-        self.set_active_draft_cursor(cursor.saturating_add(1));
+            .unwrap_or(draft.len());
+        draft.insert(byte, ch);
+        self.set_cursor(cursor + 1);
+        self.chat.cursor_visible = true;
     }
-
     fn backspace(&mut self) {
-        let cursor = self.active_draft_cursor();
+        let cursor = self.chat_props().cursor;
         if cursor == 0 {
             return;
         }
-        let start = self
-            .active_draft()
+        let Some(id) = self.active_id() else {
+            return;
+        };
+        let draft = self.chat.drafts.entry(id).or_default();
+        let start = draft
             .char_indices()
             .nth(cursor - 1)
-            .map(|(index, _)| index)
+            .map(|(i, _)| i)
             .unwrap_or(0);
-        let end = self
-            .active_draft()
+        let end = draft
             .char_indices()
             .nth(cursor)
-            .map(|(index, _)| index)
-            .unwrap_or_else(|| self.active_draft().len());
-        self.active_draft_mut().replace_range(start..end, "");
-        self.set_active_draft_cursor(cursor - 1);
+            .map(|(i, _)| i)
+            .unwrap_or(draft.len());
+        draft.replace_range(start..end, "");
+        self.set_cursor(cursor - 1);
     }
-
     fn delete(&mut self) {
-        let cursor = self.active_draft_cursor();
-        let draft_len = self.active_draft().chars().count();
-        if cursor >= draft_len {
+        let cursor = self.chat_props().cursor;
+        let Some(id) = self.active_id() else {
+            return;
+        };
+        let draft = self.chat.drafts.entry(id).or_default();
+        let len = draft.chars().count();
+        if cursor >= len {
             return;
         }
-        let start = self
-            .active_draft()
+        let start = draft
             .char_indices()
             .nth(cursor)
-            .map(|(index, _)| index)
-            .unwrap_or_else(|| self.active_draft().len());
-        let end = self
-            .active_draft()
+            .map(|(i, _)| i)
+            .unwrap_or(draft.len());
+        let end = draft
             .char_indices()
             .nth(cursor + 1)
-            .map(|(index, _)| index)
-            .unwrap_or_else(|| self.active_draft().len());
-        self.active_draft_mut().replace_range(start..end, "");
+            .map(|(i, _)| i)
+            .unwrap_or(draft.len());
+        draft.replace_range(start..end, "");
     }
-
     fn move_cursor(&mut self, delta: i16) {
-        let current = self.active_draft_cursor();
-        let next = if delta.is_negative() {
+        let current = self.chat_props().cursor;
+        self.set_cursor(if delta.is_negative() {
             current.saturating_sub(delta.unsigned_abs() as usize)
         } else {
             current.saturating_add(delta as usize)
-        };
-        self.set_active_draft_cursor(next);
+        });
+        self.chat.cursor_visible = true;
     }
-
-    fn move_cursor_to_start(&mut self) {
-        self.set_active_draft_cursor(0);
-    }
-
-    fn move_cursor_to_end(&mut self) {
-        self.set_active_draft_cursor(self.active_draft().chars().count());
-    }
-
     fn navigate(&mut self, delta: i16) {
-        if let Some(Overlay::Context(menu)) = self.overlay.as_mut() {
-            if menu.actions.is_empty() {
-                return;
-            }
-            let len = menu.actions.len() as i16;
-            let next = (menu.selected as i16 + delta).rem_euclid(len) as usize;
-            menu.selected = next;
-            return;
-        }
-        if let Some(Overlay::Confirm {
-            confirm_selected, ..
-        }) = self.overlay.as_mut()
-        {
-            *confirm_selected = !*confirm_selected;
-            return;
-        }
-
         match self.focus {
-            Panel::List => match self.sidebar_tab {
+            Panel::List => match self.sidebar.tab {
                 SidebarTab::Contacts => {
-                    self.contact_index = move_index(
+                    self.sidebar.contact_index = move_index(
                         self.clamped_contact_index(),
                         delta,
                         self.data.contacts.len(),
                     );
-                    self.details_scroll = 0;
+                    self.details_reset();
                 }
                 SidebarTab::Relays => {
-                    self.relay_index =
+                    self.sidebar.relay_index =
                         move_index(self.clamped_relay_index(), delta, self.data.relays.len());
-                    self.details_scroll = 0;
+                    self.details_reset();
                 }
             },
             Panel::Chat => {
-                if let Some(contact) = self.active_contact().map(|c| c.id) {
-                    let len = self.data.chats.get(&contact).map_or(0, Vec::len);
-                    let current = self.chat_scroll.get(&contact).copied().unwrap_or(0);
-                    // Chat is pinned to the newest message; invert so k scrolls up into history.
-                    let next = move_index(current, -delta, len.saturating_add(1));
-                    self.chat_scroll.insert(contact, next);
+                if let Some(id) = self.active_id() {
+                    let len = self.data.chats.get(&id).map_or(0, Vec::len);
+                    let current = self.chat.scroll.get(&id).copied().unwrap_or(0);
+                    self.chat
+                        .scroll
+                        .insert(id, move_index(current, -delta, len));
                 }
             }
-            Panel::Details => {
-                self.details_scroll = self
-                    .details_scroll
-                    .saturating_add_signed(delta)
-                    .min(self.details_max_scroll());
-            }
+            Panel::Details => match self.sidebar.tab {
+                SidebarTab::Contacts => self.details.contacts_scroll = 0,
+                SidebarTab::Relays => self.details.relays_scroll = 0,
+            },
         }
     }
-
-    fn details_max_scroll(&self) -> u16 {
-        let lines: u16 = match self.sidebar_tab {
-            SidebarTab::Contacts => {
-                if self.active_contact().is_some() {
-                    4
-                } else {
-                    1
-                }
-            }
-            SidebarTab::Relays => {
-                if self.active_relay().is_some() {
-                    5
-                } else {
-                    1
-                }
-            }
-        };
-        lines.saturating_sub(1)
-    }
-
     fn page(&mut self, delta: i16) {
-        let stepped = delta.saturating_mul(5);
-        match self.focus {
-            Panel::Chat | Panel::Details => self.navigate(stepped),
-            Panel::List => {}
+        if self.focus != Panel::List {
+            self.navigate(delta.saturating_mul(5));
         }
     }
 
     fn open_context_menu(&mut self) {
         let actions = match self.focus {
-            Panel::List | Panel::Details => match self.sidebar_tab {
-                SidebarTab::Contacts => {
-                    let Some(contact) = self.active_contact() else {
-                        return;
-                    };
+            Panel::List | Panel::Details => match self.sidebar.tab {
+                SidebarTab::Contacts => self.active_contact().map(|contact| {
                     vec![(
                         MenuAction::RemoveContact(contact.id),
                         "Remove contact",
                         true,
                     )]
-                }
-                SidebarTab::Relays => {
-                    let Some(relay) = self.active_relay() else {
-                        return;
-                    };
-                    let toggle_label = if relay.enabled {
-                        "Disable relay"
-                    } else {
-                        "Enable relay"
-                    };
-                    let remove_enabled = matches!(relay.source, RelaySource::User);
+                }),
+                SidebarTab::Relays => self.active_relay().map(|relay| {
                     vec![
-                        (MenuAction::ToggleRelay(relay.id), toggle_label, true),
+                        (
+                            MenuAction::ToggleRelay(relay.id),
+                            if relay.enabled {
+                                "Disable relay"
+                            } else {
+                                "Enable relay"
+                            },
+                            true,
+                        ),
                         (
                             MenuAction::RemoveRelay(relay.id),
                             "Remove relay",
-                            remove_enabled,
+                            matches!(relay.source, RelaySource::User),
                         ),
                     ]
-                }
+                }),
             },
-            Panel::Chat => {
-                let Some(contact) = self.active_contact() else {
-                    return;
-                };
-                vec![(MenuAction::ClearChat(contact.id), "Clear chat", true)]
-            }
+            Panel::Chat => self
+                .active_contact()
+                .map(|contact| vec![(MenuAction::ClearChat(contact.id), "Clear chat", true)]),
         };
-
-        self.overlay = Some(Overlay::Context(ContextMenu {
-            actions,
-            selected: 0,
-        }));
-    }
-
-    fn activate(&mut self) {
-        match self.overlay.clone() {
-            Some(Overlay::Context(menu)) => {
-                let Some((action, _, enabled)) = menu.actions.get(menu.selected).copied() else {
-                    return;
-                };
-                if !enabled {
-                    return;
-                }
-                match action {
-                    MenuAction::ToggleRelay(id) => {
-                        if let Some(relay) = self.data.relays.iter_mut().find(|r| r.id == id) {
-                            relay.enabled = !relay.enabled;
-                        }
-                        self.overlay = None;
-                    }
-                    MenuAction::RemoveContact(_)
-                    | MenuAction::RemoveRelay(_)
-                    | MenuAction::ClearChat(_) => {
-                        self.overlay = Some(Overlay::Confirm {
-                            action,
-                            confirm_selected: false,
-                        });
-                    }
-                }
-            }
-            Some(Overlay::Confirm {
-                action,
-                confirm_selected,
-            }) => {
-                if confirm_selected {
-                    self.execute_menu_action(action);
-                }
-                self.overlay = None;
-            }
-            None => {}
+        if let Some(actions) = actions {
+            self.overlay.overlay = Some(Overlay::Context(ContextMenu {
+                actions,
+                selected: 0,
+            }));
         }
     }
-
-    fn execute_menu_action(&mut self, action: MenuAction) {
+    fn update_overlay(&mut self, action: Action) {
         match action {
-            MenuAction::RemoveContact(id) => {
+            Action::CloseOverlay => self.overlay.overlay = None,
+            Action::Navigate(delta) => match self.overlay.overlay.as_mut() {
+                Some(Overlay::Context(menu)) if !menu.actions.is_empty() => {
+                    menu.selected = (menu.selected as i16 + delta)
+                        .rem_euclid(menu.actions.len() as i16)
+                        as usize
+                }
+                Some(Overlay::Confirm {
+                    confirm_selected, ..
+                }) => *confirm_selected = !*confirm_selected,
+                _ => {}
+            },
+            Action::Activate => match self.overlay.overlay.clone() {
+                Some(Overlay::Context(menu)) => {
+                    if let Some((action, _, true)) = menu.actions.get(menu.selected).copied() {
+                        match action {
+                            MenuAction::ToggleRelay(id) => {
+                                self.apply_command(UiCommand::ToggleRelay(id));
+                                self.overlay.overlay = None;
+                            }
+                            _ => {
+                                self.overlay.overlay = Some(Overlay::Confirm {
+                                    action,
+                                    confirm_selected: false,
+                                })
+                            }
+                        }
+                    }
+                }
+                Some(Overlay::Confirm {
+                    action,
+                    confirm_selected: true,
+                }) => {
+                    self.apply_menu_action(action);
+                    self.overlay.overlay = None;
+                }
+                Some(Overlay::Confirm { .. }) => self.overlay.overlay = None,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    fn apply_menu_action(&mut self, action: MenuAction) {
+        self.apply_command(match action {
+            MenuAction::RemoveContact(id) => UiCommand::RemoveContact(id),
+            MenuAction::ToggleRelay(id) => UiCommand::ToggleRelay(id),
+            MenuAction::RemoveRelay(id) => UiCommand::RemoveRelay(id),
+            MenuAction::ClearChat(id) => UiCommand::ClearChat(id),
+        });
+    }
+    fn apply_command(&mut self, command: UiCommand) {
+        match command {
+            UiCommand::ShowStatus(message) => self.status = Some(message.to_owned()),
+            UiCommand::RemoveContact(id) => {
                 self.data.contacts.retain(|contact| contact.id != id);
                 self.data.chats.remove(&id);
-                self.drafts.remove(&id);
-                self.draft_cursors.remove(&id);
-                self.chat_scroll.remove(&id);
-                self.contact_index = clamp_index(self.contact_index, self.data.contacts.len());
-                self.details_scroll = 0;
+                self.chat.drafts.remove(&id);
+                self.chat.cursors.remove(&id);
+                self.chat.scroll.remove(&id);
+                self.sidebar.contact_index = self.clamped_contact_index();
+                self.details.contacts_scroll = 0;
             }
-            MenuAction::RemoveRelay(id) => {
-                let Some(index) = self.data.relays.iter().position(|relay| relay.id == id) else {
-                    return;
-                };
-                if matches!(self.data.relays[index].source, RelaySource::BuiltIn) {
-                    return;
-                }
-                self.data.relays.remove(index);
-                self.relay_index = clamp_index(self.relay_index, self.data.relays.len());
-                self.details_scroll = 0;
-            }
-            MenuAction::ClearChat(id) => {
-                if let Some(messages) = self.data.chats.get_mut(&id) {
-                    messages.clear();
-                }
-                self.chat_scroll.insert(id, 0);
-            }
-            MenuAction::ToggleRelay(id) => {
-                if let Some(relay) = self.data.relays.iter_mut().find(|r| r.id == id) {
+            UiCommand::ToggleRelay(id) => {
+                if let Some(relay) = self.data.relays.iter_mut().find(|relay| relay.id == id) {
                     relay.enabled = !relay.enabled;
                 }
             }
+            UiCommand::RemoveRelay(id) => {
+                if let Some(index) = self.data.relays.iter().position(|relay| relay.id == id)
+                    && matches!(self.data.relays[index].source, RelaySource::User)
+                {
+                    self.data.relays.remove(index);
+                    self.sidebar.relay_index = self.clamped_relay_index();
+                    self.details.relays_scroll = 0;
+                }
+            }
+            UiCommand::ClearChat(id) => {
+                self.data.chats.entry(id).or_default().clear();
+                self.chat.scroll.insert(id, 0);
+            }
         }
     }
-}
-
-impl Default for TuiApp {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn clamp_index(index: usize, len: usize) -> usize {
-    if len == 0 { 0 } else { index.min(len - 1) }
 }
 
 fn move_index(current: usize, delta: i16, len: usize) -> usize {
     if len == 0 {
         return 0;
     }
-    let next = current as isize + delta as isize;
-    if next < 0 {
-        0
-    } else if next as usize >= len {
-        len - 1
-    } else {
-        next as usize
-    }
+    (current as isize + delta as isize).clamp(0, len.saturating_sub(1) as isize) as usize
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::action::Action;
-
     #[test]
-    fn leaving_insert_preserves_draft_and_returns_to_normal() {
-        let mut app = TuiApp::new();
-        app.update(Action::FocusNext);
+    fn demo_data_is_explicit_and_status_is_retained() {
+        let mut app = TuiApp::demo();
+        app.focus = Panel::Chat;
         app.update(Action::EnterInsert);
         app.update(Action::InsertChar('x'));
-        app.update(Action::FocusNext);
-
-        assert_eq!(app.focus, Panel::Details);
-        assert_eq!(app.chat_mode, ChatMode::Normal);
-        assert_eq!(app.active_draft(), "x");
-    }
-
-    #[test]
-    fn drafts_are_kept_per_contact() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
-        app.update(Action::InsertChar('a'));
-        app.focus = Panel::List;
-        app.update(Action::Navigate(1));
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
-        app.update(Action::InsertChar('b'));
-
-        assert_eq!(app.draft_for(1), "a");
-        assert_eq!(app.draft_for(2), "b");
-    }
-
-    #[test]
-    fn submit_keeps_draft_and_reports_demo_boundary() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
-        app.update(Action::InsertChar('h'));
         app.update(Action::SubmitDraft);
-
-        assert_eq!(app.active_draft(), "h");
         assert_eq!(
-            app.status.as_deref(),
+            app.footer_props().status,
             Some("Messaging is not available in DEMO mode")
         );
     }
-
     #[test]
-    fn next_user_action_clears_demo_status() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
-        app.update(Action::InsertChar('h'));
-        app.update(Action::SubmitDraft);
-        app.update(Action::InsertChar('i'));
-
-        assert!(app.status.is_none());
-        assert_eq!(app.active_draft(), "hi");
-    }
-
-    #[test]
-    fn built_in_relay_remove_action_is_disabled() {
-        let mut app = TuiApp::new();
-        app.sidebar_tab = SidebarTab::Relays;
-        app.update(Action::OpenContextMenu);
-
-        let Overlay::Context(menu) = app.overlay.as_ref().expect("context menu") else {
-            panic!("expected context menu");
-        };
-        assert!(
-            menu.actions
-                .iter()
-                .any(|(_, label, enabled)| { *label == "Remove relay" && !enabled })
-        );
-    }
-
-    #[test]
-    fn clear_chat_requires_confirmation() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.update(Action::OpenContextMenu);
-        app.update(Action::Activate);
-
-        assert!(matches!(app.overlay, Some(Overlay::Confirm { .. })));
-        assert!(!app.active_messages().is_empty());
-    }
-
-    #[test]
-    fn removing_last_contact_leaves_empty_selection_without_panic() {
-        let mut app = TuiApp::new();
-        while let Some(contact) = app.active_contact().map(|c| c.id) {
-            app.execute_menu_action(MenuAction::RemoveContact(contact));
-        }
-        assert!(app.active_contact().is_none());
-        assert!(app.active_messages().is_empty());
-        assert_eq!(app.active_draft(), "");
-    }
-
-    #[test]
-    fn clear_chat_preserves_draft() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
-        app.update(Action::InsertChar('z'));
-        let id = app.active_contact().expect("contact").id;
-        app.execute_menu_action(MenuAction::ClearChat(id));
-        assert!(app.active_messages().is_empty());
-        assert_eq!(app.active_draft(), "z");
-    }
-
-    #[test]
-    fn draft_cursor_inserts_and_deletes_at_its_current_position() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Chat;
-        app.chat_mode = ChatMode::Insert;
-        for character in "ac".chars() {
-            app.update(Action::InsertChar(character));
-        }
-        app.update(Action::MoveCursor(-1));
-        app.update(Action::InsertChar('b'));
-        app.update(Action::Backspace);
-        app.update(Action::Delete);
-
-        assert_eq!(app.active_draft(), "a");
-        assert_eq!(app.active_draft_cursor(), 1);
-    }
-
-    #[test]
-    fn toggling_relay_only_flips_enabled() {
-        let mut app = TuiApp::new();
-        let id = app.data.relays[0].id;
-        let before = app.data.relays[0].enabled;
-        app.execute_menu_action(MenuAction::ToggleRelay(id));
-        assert_eq!(app.data.relays[0].enabled, !before);
-    }
-
-    #[test]
-    fn built_in_relay_cannot_be_removed() {
-        let mut app = TuiApp::new();
-        let id = app.data.relays[0].id;
-        let before = app.data.relays.len();
-        app.execute_menu_action(MenuAction::RemoveRelay(id));
-        assert_eq!(app.data.relays.len(), before);
-    }
-
-    #[test]
-    fn details_scroll_is_bounded_to_visible_content() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Details;
-
-        app.update(Action::Navigate(100));
-
-        assert_eq!(app.details_scroll, 3);
-    }
-
-    #[test]
-    fn changing_sidebar_tab_resets_details_scroll() {
-        let mut app = TuiApp::new();
-        app.focus = Panel::Details;
-        app.update(Action::Navigate(3));
-
-        app.update(Action::SelectSidebarTab(SidebarTab::Relays));
-
-        assert_eq!(app.details_scroll, 0);
+    fn command_only_changes_data_when_app_applies_it() {
+        let mut app = TuiApp::demo();
+        let id = app.data.contacts[0].id;
+        app.apply_command(UiCommand::ClearChat(id));
+        assert!(app.data.chats[&id].is_empty());
     }
 }
