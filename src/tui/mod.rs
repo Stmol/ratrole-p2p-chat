@@ -1,7 +1,16 @@
+mod action;
 mod app;
+mod components;
+mod input;
+mod layout;
+mod model;
+mod theme;
 mod ui;
 
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use crossterm::{
@@ -43,18 +52,27 @@ pub fn run() -> Result<()> {
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = TuiApp::new();
+    let blink_interval = Duration::from_millis(500);
+    let mut next_blink = Instant::now() + blink_interval;
 
     while !app.should_quit {
         terminal.draw(|frame| ui::render(frame, &app))?;
-
-        if event::poll(Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.on_key(key);
+        let timeout = next_blink.saturating_duration_since(Instant::now());
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let action = input::action_for_key(&app, key);
+                    app.update(action);
+                    next_blink = Instant::now() + blink_interval;
+                }
+                Event::Resize(_, _) => {}
+                _ => {}
+            }
+        } else {
+            app.toggle_cursor_blink();
+            next_blink = Instant::now() + blink_interval;
         }
     }
-
     Ok(())
 }
 

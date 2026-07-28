@@ -22,12 +22,31 @@ Install the stable Rust toolchain, then run:
 cargo run
 ```
 
-Launching without arguments opens the terminal UI. Press `q`, `Esc`, or `Ctrl-C` to exit. Explicit commands are reserved for focused automation and will report their bootstrap status until their domain behaviour is implemented.
+Launching without arguments opens the terminal UI preview. Explicit commands are reserved for focused automation and will report their bootstrap status until their domain behaviour is implemented.
 
 ```sh
 cargo run -- --version
 cargo test
 ```
+
+## Terminal UI preview
+
+Running `rathole` without arguments opens a keyboard-first UI preview backed by
+in-memory demo data. Contacts, presence values, relay state, chat history, and
+context-menu changes are not loaded from or written to persistent storage.
+Message submission is deliberately unavailable.
+
+- `Tab` / `Shift+Tab`: cycle List, Chat, and Details
+- `j/k` or arrow keys: select or scroll in the focused panel
+- `h/l` or left/right: switch Contacts and Relays while List is focused
+- `x`: open the focused item’s context menu in Normal mode
+- `i` or `Enter`: enter Chat Insert mode
+- `Esc`: leave Insert mode or close a modal
+- `Ctrl+C`: quit
+
+The UI shows all three panels at 120 columns and wider, two panels from 80 to
+119 columns, and one focused panel from 40 to 79 columns. Smaller terminals
+show resize guidance.
 
 ## Project layout
 
