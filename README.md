@@ -22,6 +22,14 @@ The first client is a Rust terminal application. Future compatible clients may b
 - contacts.toml is temporary public storage and will later migrate to SQLite.
 - Replacing a device key changes the peer ID; UserPeerId and multi-device migration are future work.
 
+## Chat wire protocol (foundation)
+
+- The standalone v1 contract is in `src/protocol/`; it serialises one complete CBOR document and has no Iroh, TUI, storage, or domain-contact dependency.
+- Each document is `WireEnvelope { protocol_version: 1, frame }`; unknown fields and versions are rejected.
+- Supported frames are `Text { message_id, sent_at_unix_ms, body }`, `Accepted { message_id, received_at_unix_ms }`, and `Rejected { message_id, code }`.
+- `MessageId` is exactly 16 binary bytes. Text is non-empty UTF-8, preserves emoji and newlines, and is limited to 16 KiB; a full encoded document is limited to 32 KiB.
+- This is not live chat yet. A future Iroh adapter must supply stream framing and peer authorisation from the authenticated Iroh connection before it invokes this codec.
+
 ## Run
 
 Install the stable Rust toolchain, then run:
