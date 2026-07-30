@@ -10,7 +10,7 @@ The first client is a Rust terminal application. Future compatible clients may b
 - The Iroh device secret is held by the operating system keychain, never in plaintext configuration.
 - Contacts are local and one-way. Adding a contact only validates and stores an EndpointId locally.
 - Rathole ships a versioned bootstrap relay list, including n0 relay infrastructure. Relay persistence and mutation remain future work.
-- A durable multi-device `UserPeerId`, recovery phrases, presence exchange, and chat transport are future subsystems.
+- A durable multi-device `UserPeerId`, recovery phrases, and presence exchange are future subsystems. An online chat transport library exists under `src/network/chat/` but is not wired into the CLI/TUI yet.
 
 ## Identity and contacts (MVP)
 
@@ -29,6 +29,16 @@ The first client is a Rust terminal application. Future compatible clients may b
 - Supported frames are `Text { message_id, sent_at_unix_ms, body }`, `Accepted { message_id, received_at_unix_ms }`, and `Rejected { message_id, code }`.
 - `MessageId` is exactly 16 binary bytes. Text is non-empty UTF-8, preserves emoji and newlines, and is limited to 16 KiB; a full encoded document is limited to 32 KiB.
 - This is not live chat yet. A future Iroh adapter must supply stream framing and peer authorisation from the authenticated Iroh connection before it invokes this codec.
+
+## Online chat transport (MVP foundation)
+
+- `src/network/chat/` provides a tested library transport using Iroh ALPN `rathole/chat/1`. The current CLI/TUI does not start it or display messages yet.
+- Delivery is allowed only to locally stored contacts. Incoming authorisation uses the authenticated Iroh `EndpointId`, not an identity field inside CBOR.
+- A live Iroh connection is reused when available, but each message has its own bidirectional stream and `Text → Accepted | Rejected` exchange.
+- Each stream document has a four-byte big-endian length prefix and a 32 KiB maximum CBOR body. Incoming and per-peer outgoing queues are capped at 64 messages. A full per-peer outgoing queue returns `QueueFull` immediately instead of blocking the caller.
+- Messages from one sender worker are attempted FIFO while its connection remains healthy. Timeouts, reconnects, and simultaneous bidirectional sends do not provide a durable global order.
+- Delivery is online-only with a 30-second local deadline that starts when `send_text` accepts a message into the per-peer outgoing queue and covers queueing, dial, and stream I/O. There is no persistence, retry, deduplication, sequence number, offline mailbox, or presence claim yet.
+- Removing a contact closes cached connections, drains that peer's outbound worker, and cancels queued deliveries with `NotAContact`. Inbound connections from non-contacts are limited to a bounded handler budget with stream timeouts.
 
 ## Run
 

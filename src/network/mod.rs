@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod identity;
 
 /// Returns the selected transport label while making the Iroh dependency part
