@@ -1,12 +1,12 @@
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr, endpoint::presets};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::framing::{read_document, write_document};
 use super::transport::{exhaust_inbound_handler_budget, inbound_handler_budget, set_test_route};
 use super::{
-    CHAT_ALPN, ChatClient, ChatTransport, DeliveryError, INCOMING_QUEUE_CAPACITY, IncomingText,
+    CHAT_ALPN, ChatClient, ChatTransport, DeliveryError, INBOUND_STREAM_TIMEOUT, IncomingText,
     OUTGOING_QUEUE_CAPACITY,
 };
 use crate::domain::identity::PeerId;
@@ -42,6 +42,27 @@ async fn direct_loopback_addr(transport: &ChatTransport) -> EndpointAddr {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let mut addr = transport.endpoint().addr();
+        addr.addrs.retain(|transport_addr| {
+            matches!(
+                transport_addr,
+                TransportAddr::Ip(socket) if socket.ip().is_loopback()
+            )
+        });
+        if addr.ip_addrs().next().is_some() {
+            return addr;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for local direct addresses"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn direct_loopback_endpoint_addr(endpoint: &Endpoint) -> EndpointAddr {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut addr = endpoint.addr();
         addr.addrs.retain(|transport_addr| {
             matches!(
                 transport_addr,
@@ -99,6 +120,107 @@ async fn authorised_contacts_exchange_unicode_text_and_an_ack() {
 
     alice.transport.shutdown().await.unwrap();
     bob.transport.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn subsequent_delivery_after_idle_uses_a_new_connection() {
+    let bob_secret = SecretKey::from_bytes(&[102; 32]);
+    let alice_secret = SecretKey::from_bytes(&[101; 32]);
+    let alice_id = peer_id_from_secret(&alice_secret);
+    let mut bob = local_peer(bob_secret, [alice_id.clone()]).await;
+    let alice = Endpoint::builder(presets::N0)
+        .secret_key(alice_secret)
+        .alpns(vec![CHAT_ALPN.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let connection = alice
+        .connect(direct_loopback_addr(&bob.transport).await, CHAT_ALPN)
+        .await
+        .unwrap();
+
+    connection.close(0u32.into(), b"one delivery per connection");
+    tokio::time::sleep(INBOUND_STREAM_TIMEOUT + Duration::from_millis(250)).await;
+
+    let connection = alice
+        .connect(direct_loopback_addr(&bob.transport).await, CHAT_ALPN)
+        .await
+        .unwrap();
+
+    let message_id = MessageId::new([103; 16]);
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    write_document(
+        &mut send,
+        &WireEnvelope::new(ChatFrame::text(message_id, 1, "after idle").unwrap()),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_secs(2), bob.incoming.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(incoming.message_id, message_id);
+    let receipt = read_document(&mut recv).await.unwrap();
+    assert!(
+        matches!(receipt.frame, ChatFrame::Accepted { message_id: id, .. } if id == message_id)
+    );
+
+    alice.close().await;
+    bob.transport.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn receipt_survives_slow_remote_read() {
+    let sender_secret = SecretKey::from_bytes(&[103; 32]);
+    let receiver_secret = SecretKey::from_bytes(&[104; 32]);
+    let sender_id = peer_id_from_secret(&sender_secret);
+    let mut receiver = local_peer(receiver_secret, [sender_id.clone()]).await;
+    let sender = Endpoint::builder(presets::N0)
+        .secret_key(sender_secret)
+        .alpns(vec![CHAT_ALPN.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let connection = sender
+        .connect(direct_loopback_addr(&receiver.transport).await, CHAT_ALPN)
+        .await
+        .unwrap();
+    let message_id = MessageId::new([105; 16]);
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    write_document(
+        &mut send,
+        &WireEnvelope::new(ChatFrame::text(message_id, 1, "slow receipt").unwrap()),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_secs(2), receiver.incoming.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(incoming.message_id, message_id);
+    tokio::time::sleep(INBOUND_STREAM_TIMEOUT + Duration::from_secs(1)).await;
+    let receipt = tokio::time::timeout(Duration::from_secs(2), read_document(&mut recv))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(receipt.frame, ChatFrame::Accepted { message_id: id, .. } if id == message_id)
+    );
+
+    sender.close().await;
+    receiver.transport.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -183,6 +305,91 @@ async fn simultaneous_bidirectional_sends_are_delivered_without_global_order_cla
     assert_eq!(bob.incoming.recv().await.unwrap().body, "from Alice");
     alice_handle.wait().await.unwrap();
     bob_handle.wait().await.unwrap();
+
+    alice.transport.shutdown().await.unwrap();
+    bob.transport.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reply_can_start_before_the_first_delivery_handle_settles() {
+    let (mut alice, mut bob) = local_pair().await;
+    let first = alice
+        .client
+        .send_text(bob.peer_id.clone(), "from Alice")
+        .await
+        .unwrap();
+
+    assert_eq!(bob.incoming.recv().await.unwrap().body, "from Alice");
+    let reply = bob
+        .client
+        .send_text(alice.peer_id.clone(), "from Bob")
+        .await
+        .unwrap();
+    assert_eq!(alice.incoming.recv().await.unwrap().body, "from Bob");
+
+    first.wait().await.unwrap();
+    reply.wait().await.unwrap();
+    alice.transport.shutdown().await.unwrap();
+    bob.transport.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sequential_reply_works_after_alice_establishes_connection() {
+    let (mut alice, mut bob) = local_pair().await;
+
+    let first = alice
+        .client
+        .send_text(bob.peer_id.clone(), "from Alice")
+        .await
+        .unwrap();
+
+    assert_eq!(bob.incoming.recv().await.unwrap().body, "from Alice");
+    first.wait().await.unwrap();
+
+    let reply = bob
+        .client
+        .send_text(alice.peer_id.clone(), "from Bob")
+        .await
+        .unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_secs(2), alice.incoming.recv())
+        .await
+        .expect("reply should reach Alice")
+        .expect("Alice incoming channel should remain open");
+
+    assert_eq!(incoming.body, "from Bob");
+    reply.wait().await.unwrap();
+
+    alice.transport.shutdown().await.unwrap();
+    bob.transport.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sequential_reply_works_after_bob_establishes_connection() {
+    let (mut alice, mut bob) = local_pair().await;
+
+    let first = bob
+        .client
+        .send_text(alice.peer_id.clone(), "from Bob")
+        .await
+        .unwrap();
+
+    assert_eq!(alice.incoming.recv().await.unwrap().body, "from Bob");
+    first.wait().await.unwrap();
+
+    let reply = alice
+        .client
+        .send_text(bob.peer_id.clone(), "from Alice")
+        .await
+        .unwrap();
+
+    let incoming = tokio::time::timeout(Duration::from_secs(2), bob.incoming.recv())
+        .await
+        .expect("reply should reach Bob")
+        .expect("Bob incoming channel should remain open");
+
+    assert_eq!(incoming.body, "from Alice");
+    reply.wait().await.unwrap();
 
     alice.transport.shutdown().await.unwrap();
     bob.transport.shutdown().await.unwrap();
@@ -393,14 +600,61 @@ async fn wrong_receipt_frame_is_a_protocol_violation_and_evicts() {
 
 #[tokio::test]
 async fn removing_contact_cancels_queued_outbound_deliveries() {
-    let (alice, mut bob) = local_pair().await;
+    let alice_secret = SecretKey::from_bytes(&[83; 32]);
+    let bob_secret = SecretKey::from_bytes(&[84; 32]);
+    let bob_peer_id = peer_id_from_secret(&bob_secret);
+    let bob_endpoint_id = bob_secret.public();
 
-    let mut handles = Vec::with_capacity(OUTGOING_QUEUE_CAPACITY);
+    let alice = local_peer(alice_secret, [bob_peer_id.clone()]).await;
+    let bob = Endpoint::builder(presets::N0)
+        .secret_key(bob_secret)
+        .alpns(vec![CHAT_ALPN.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    set_test_route(
+        alice.transport.inner(),
+        bob_endpoint_id,
+        direct_loopback_endpoint_addr(&bob).await,
+    )
+    .await;
+
+    let (first_delivery_seen_tx, first_delivery_seen_rx) = oneshot::channel();
+    let (release_blocked_stream_tx, release_blocked_stream_rx) = oneshot::channel::<()>();
+    let accept_first = {
+        let bob = bob.clone();
+        tokio::spawn(async move {
+            let incoming = bob.accept().await.expect("first incoming connection");
+            let connection = incoming.await.expect("first connection");
+            let (_send, mut recv) = connection.accept_bi().await.expect("first bidi stream");
+            let envelope = read_document(&mut recv).await.expect("first text frame");
+            assert!(matches!(envelope.frame, ChatFrame::Text { .. }));
+            let _ = first_delivery_seen_tx.send(());
+            let _ = release_blocked_stream_rx.await;
+            connection.close(0u32.into(), b"test done");
+        })
+    };
+
+    let blocked = alice
+        .client
+        .send_text(bob_peer_id.clone(), "blocked-first")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), first_delivery_seen_rx)
+        .await
+        .expect("first delivery should reach the remote peer")
+        .unwrap();
+
+    let mut queued = Vec::with_capacity(OUTGOING_QUEUE_CAPACITY);
     for index in 0..OUTGOING_QUEUE_CAPACITY {
-        handles.push(
+        queued.push(
             alice
                 .client
-                .send_text(bob.peer_id.clone(), format!("queued-{index}"))
+                .send_text(bob_peer_id.clone(), format!("queued-{index}"))
                 .await
                 .unwrap(),
         );
@@ -408,59 +662,60 @@ async fn removing_contact_cancels_queued_outbound_deliveries() {
 
     alice.transport.replace_contacts([]).await.unwrap();
 
-    let mut not_a_contact = 0;
-    for handle in handles {
-        if matches!(handle.wait().await, Err(DeliveryError::NotAContact)) {
-            not_a_contact += 1;
-        }
+    for handle in queued {
+        assert!(matches!(
+            handle.wait().await,
+            Err(DeliveryError::NotAContact)
+        ));
     }
     assert!(
-        not_a_contact > 0,
-        "expected at least one queued delivery to be cancelled"
+        blocked.wait().await.is_err(),
+        "revoking a contact should also settle the in-flight delivery"
+    );
+    assert!(matches!(
+        alice
+            .client
+            .send_text(bob_peer_id.clone(), "blocked-next")
+            .await,
+        Err(DeliveryError::NotAContact)
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), bob.accept())
+            .await
+            .is_err(),
+        "revoked sends should be rejected before any new dial"
     );
 
-    let mut received = 0;
-    while tokio::time::timeout(Duration::from_millis(50), bob.incoming.recv())
-        .await
-        .is_ok()
-    {
-        received += 1;
-    }
-    assert!(
-        received < OUTGOING_QUEUE_CAPACITY,
-        "removed contact should not deliver the full queued batch"
-    );
+    let _ = release_blocked_stream_tx.send(());
+    accept_first.await.unwrap();
 
     alice.transport.shutdown().await.unwrap();
-    bob.transport.shutdown().await.unwrap();
+    bob.close().await;
 }
 
 #[tokio::test]
 async fn outbound_queue_full_returns_immediately() {
-    let (alice, _bob) = local_pair().await;
-
-    for index in 0..INCOMING_QUEUE_CAPACITY {
-        alice
-            .client
-            .send_text(_bob.peer_id.clone(), format!("fill-in-{index}"))
-            .await
-            .unwrap();
-    }
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (alice, bob) = local_pair().await;
+    let dead_listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    set_test_route(
+        alice.transport.inner(),
+        bob.endpoint_id,
+        EndpointAddr::from_parts(bob.endpoint_id, vec![TransportAddr::Ip(dead_addr)]),
+    )
+    .await;
 
     alice
         .client
-        .send_text(_bob.peer_id.clone(), "blocker")
+        .send_text(bob.peer_id.clone(), "active")
         .await
         .unwrap();
-
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     for index in 0..OUTGOING_QUEUE_CAPACITY {
         alice
             .client
-            .send_text(_bob.peer_id.clone(), format!("fill-out-{index}"))
+            .send_text(bob.peer_id.clone(), format!("fill-out-{index}"))
             .await
             .unwrap();
     }
@@ -468,13 +723,13 @@ async fn outbound_queue_full_returns_immediately() {
     assert!(matches!(
         alice
             .client
-            .send_text(_bob.peer_id.clone(), "overflow")
+            .send_text(bob.peer_id.clone(), "overflow")
             .await,
         Err(DeliveryError::QueueFull)
     ));
 
     alice.transport.shutdown().await.unwrap();
-    _bob.transport.shutdown().await.unwrap();
+    bob.transport.shutdown().await.unwrap();
 }
 
 #[tokio::test]

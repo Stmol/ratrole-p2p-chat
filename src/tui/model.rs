@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::domain::{contact::Contact, identity::PeerId, relay::RelaySource};
+use crate::protocol::MessageId;
 
 pub type ContactId = PeerId;
 pub type RelayId = usize;
@@ -8,11 +9,15 @@ pub type RelayId = usize;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContactView {
     pub peer_id: PeerId,
+    pub unread_count: usize,
 }
 
 impl ContactView {
     pub fn from_peer_id(peer_id: PeerId) -> Self {
-        Self { peer_id }
+        Self {
+            peer_id,
+            unread_count: 0,
+        }
     }
 
     pub fn id(&self) -> ContactId {
@@ -35,11 +40,22 @@ pub enum MessageSender {
     Contact,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryState {
+    Pending,
+    Delivered,
+    Rejected,
+    TimedOut,
+    Failed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MessageView {
+    pub message_id: MessageId,
     pub sender: MessageSender,
     pub timestamp: String,
     pub body: String,
+    pub delivery: Option<DeliveryState>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +112,13 @@ pub fn fit_peer_id(value: &str, max_chars: usize) -> String {
     format!("{first}…{last}")
 }
 
+pub fn utc_time_label(unix_ms: i64) -> String {
+    let seconds = unix_ms.div_euclid(1_000);
+    let hours = seconds.div_euclid(3_600).rem_euclid(24);
+    let minutes = seconds.div_euclid(60).rem_euclid(60);
+    format!("{hours:02}:{minutes:02} UTC")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +145,10 @@ mod tests {
         assert!(fitted.contains('…'));
         assert!(fitted.starts_with("890456a6bd153"));
         assert!(fitted.ends_with("f06cec88"));
+    }
+
+    #[test]
+    fn utc_time_label_uses_utc_clock_fields_without_a_timezone_dependency() {
+        assert_eq!(utc_time_label(3_661_000), "01:01 UTC");
     }
 }

@@ -9,7 +9,7 @@ use ratatui::{
 use crate::domain::identity::PeerId;
 use crate::tui::{
     action::{Panel, SidebarTab},
-    components::props::OverlayProps,
+    components::{editor::TextEditor, props::OverlayProps},
     config::OverlayConfig,
     model::{ContactId, fit_peer_id},
     theme::UiTheme,
@@ -35,8 +35,7 @@ pub(crate) struct ContextMenu {
 pub(crate) enum Overlay {
     Context(ContextMenu),
     AddContact {
-        draft: String,
-        cursor: usize,
+        editor: TextEditor,
         error: Option<String>,
     },
     FirstRunIdentity {
@@ -61,11 +60,15 @@ pub fn render_overlay(
             action,
             confirm_selected,
         }) => render_confirm(frame, area, action, *confirm_selected, config, theme),
-        Some(Overlay::AddContact {
-            draft,
-            cursor,
-            error,
-        }) => render_add_contact(frame, area, draft, *cursor, error.as_deref(), config, theme),
+        Some(Overlay::AddContact { editor, error }) => render_add_contact(
+            frame,
+            area,
+            editor.text(),
+            editor.cursor(),
+            error.as_deref(),
+            config,
+            theme,
+        ),
         Some(Overlay::FirstRunIdentity { peer_id }) => {
             render_first_run(frame, area, peer_id, config, theme)
         }
@@ -362,8 +365,7 @@ mod tests {
     #[test]
     fn add_contact_modal_shows_paste_prompt() {
         let overlay = Overlay::AddContact {
-            draft: String::new(),
-            cursor: 0,
+            editor: TextEditor::default(),
             error: None,
         };
         let text = render_overlay_text(
@@ -408,9 +410,10 @@ mod tests {
     #[test]
     fn add_contact_modal_keeps_long_peer_id_on_one_line() {
         let draft = "890456a6bd1534a61bc194d54987895b3547f91d3293abca294ce944f06cec88";
+        let mut editor = TextEditor::default();
+        editor.paste(draft);
         let overlay = Overlay::AddContact {
-            draft: draft.to_owned(),
-            cursor: draft.chars().count(),
+            editor,
             error: None,
         };
         let text = render_overlay_text(

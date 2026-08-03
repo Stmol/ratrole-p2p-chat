@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::tui::{
     action::{ChatMode, SidebarTab},
     model::ContactId,
 };
 
-use super::overlay::Overlay;
+use super::{editor::TextEditor, overlay::Overlay};
 
 #[derive(Debug)]
 pub(crate) struct SidebarState {
@@ -28,9 +28,9 @@ impl Default for SidebarState {
 pub(crate) struct ChatState {
     pub mode: ChatMode,
     pub cursor_visible: bool,
-    pub drafts: BTreeMap<ContactId, String>,
-    pub cursors: BTreeMap<ContactId, usize>,
+    pub drafts: BTreeMap<ContactId, TextEditor>,
     pub scroll: BTreeMap<ContactId, usize>,
+    pub pending_send: BTreeSet<ContactId>,
 }
 
 impl Default for ChatState {
@@ -39,8 +39,8 @@ impl Default for ChatState {
             mode: ChatMode::Normal,
             cursor_visible: true,
             drafts: BTreeMap::new(),
-            cursors: BTreeMap::new(),
             scroll: BTreeMap::new(),
+            pending_send: BTreeSet::new(),
         }
     }
 }

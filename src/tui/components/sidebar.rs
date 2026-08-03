@@ -86,10 +86,16 @@ fn render_contacts(frame: &mut Frame, area: Rect, props: &SidebarProps<'_>, them
         .contacts
         .iter()
         .map(|contact| {
-            ListItem::new(Line::from(Span::styled(
-                short_peer_id(&contact.peer_id),
-                Style::new().fg(theme.text),
-            )))
+            let label = if contact.unread_count == 0 {
+                short_peer_id(&contact.peer_id)
+            } else {
+                format!(
+                    "{} ({})",
+                    short_peer_id(&contact.peer_id),
+                    contact.unread_count
+                )
+            };
+            ListItem::new(Line::from(Span::styled(label, Style::new().fg(theme.text))))
         })
         .collect();
 
@@ -310,6 +316,26 @@ mod tests {
         );
         assert!(text.contains(&short_peer_id(&contact.peer_id)));
         assert!(!text.contains("presence"));
+    }
+
+    #[test]
+    fn contacts_row_includes_unread_count_only_when_nonzero() {
+        let mut contact = ContactView::from_peer_id(peer_id_for_test(4));
+        contact.unread_count = 2;
+        let text = render_sidebar_props(
+            SidebarProps {
+                focused: true,
+                tab: SidebarTab::Contacts,
+                contacts: std::slice::from_ref(&contact),
+                relays: &[],
+                selected: 0,
+            },
+            &UiConfig::default().sidebar,
+            &UiTheme::default(),
+            48,
+            16,
+        );
+        assert!(text.contains("(2)"));
     }
 
     #[test]

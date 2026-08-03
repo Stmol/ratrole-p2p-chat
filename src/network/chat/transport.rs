@@ -1,34 +1,36 @@
 use std::{
-    collections::HashMap,
-    sync::{Arc, atomic::AtomicBool},
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey,
     endpoint::{Connection, presets},
 };
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time;
 
-use super::framing::{read_document, write_document};
+#[cfg(not(test))]
+use super::IrohPathMode;
+use super::framing::{read_single_document, write_document};
 use super::worker::{PeerWorker, QueuedDelivery, spawn_deadline};
 use super::{
-    CHAT_ALPN, ChatClient, ChatStartError, ChatTransport, ContactAllowlist, DELIVERY_TIMEOUT,
-    DeliveryError, DeliveryHandle, INBOUND_STREAM_TIMEOUT, INCOMING_QUEUE_CAPACITY, IncomingText,
-    MAX_INBOUND_HANDLERS, random_message_id, unix_ms_now,
+    CHAT_ALPN, ChatClient, ChatStartError, ChatTransport, ChatTransportConfig, CompletionSlot,
+    ContactAllowlist, DELIVERY_TIMEOUT, DeliveryError, DeliveryHandle, INBOUND_STREAM_TIMEOUT,
+    INCOMING_QUEUE_CAPACITY, IncomingText, MAX_INBOUND_HANDLERS, random_message_id, unix_ms_now,
 };
 use crate::domain::identity::PeerId;
+use crate::logging::{self, LogFields};
 use crate::network::identity::peer_id_to_endpoint_id;
-use crate::protocol::{ChatFrame, RejectionCode, WireEnvelope};
+use crate::protocol::{ChatFrame, MessageId, RejectionCode, WireEnvelope};
 
 pub(super) struct TransportInner {
     pub(super) endpoint: Endpoint,
     pub(super) contacts: ContactAllowlist,
     pub(super) incoming_tx: mpsc::Sender<IncomingText>,
-    pub(super) connections: Mutex<HashMap<EndpointId, Connection>>,
-    pub(super) connecting: Mutex<HashMap<EndpointId, Arc<Notify>>>,
     pub(super) workers: Mutex<HashMap<EndpointId, PeerWorker>>,
     pub(super) inbound_handlers: Arc<Semaphore>,
+    pub(super) config: ChatTransportConfig,
     #[cfg(test)]
     pub(super) test_routes: Mutex<HashMap<EndpointId, EndpointAddr>>,
 }
@@ -38,88 +40,46 @@ impl TransportInner {
         endpoint: Endpoint,
         contacts: ContactAllowlist,
         incoming_tx: mpsc::Sender<IncomingText>,
+        config: ChatTransportConfig,
     ) -> Self {
         Self {
             endpoint,
             contacts,
             incoming_tx,
-            connections: Mutex::new(HashMap::new()),
-            connecting: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
             inbound_handlers: Arc::new(Semaphore::new(MAX_INBOUND_HANDLERS)),
+            config,
             #[cfg(test)]
             test_routes: Mutex::new(HashMap::new()),
         }
     }
 
-    pub(super) async fn connection_for(
+    pub(super) async fn connect_for(
         &self,
         peer: EndpointId,
         deadline: tokio::time::Instant,
-    ) -> Result<Connection, DeliveryError> {
-        {
-            let guard = self.connections.lock().await;
-            if let Some(connection) = guard.get(&peer) {
-                return Ok(connection.clone());
-            }
-        }
-
-        let notify = {
-            let mut connecting = self.connecting.lock().await;
-            if let Some(existing) = connecting.get(&peer) {
-                let notify = existing.clone();
-                drop(connecting);
-                if tokio::time::timeout_at(deadline, notify.notified())
-                    .await
-                    .is_err()
-                {
-                    return Err(DeliveryError::TimedOut);
-                }
-                let guard = self.connections.lock().await;
-                if let Some(connection) = guard.get(&peer) {
-                    return Ok(connection.clone());
-                }
-                return Err(DeliveryError::Transport(
-                    "peer connection attempt failed".to_owned(),
-                ));
-            }
-            let notify = Arc::new(Notify::new());
-            connecting.insert(peer, notify.clone());
-            notify
-        };
-
+    ) -> Result<Connection, String> {
         let addr = self.dial_addr_for(peer).await;
-        let dial = self.endpoint.connect(addr, CHAT_ALPN);
-        match tokio::time::timeout_at(deadline, dial).await {
-            Ok(Ok(connection)) => {
-                {
-                    let mut connections = self.connections.lock().await;
-                    connections.insert(peer, connection.clone());
-                }
-                {
-                    let mut connecting = self.connecting.lock().await;
-                    connecting.remove(&peer);
-                }
-                notify.notify_waiters();
-                Ok(connection)
-            }
-            Ok(Err(error)) => {
-                {
-                    let mut connecting = self.connecting.lock().await;
-                    connecting.remove(&peer);
-                }
-                notify.notify_waiters();
-                Err(DeliveryError::Transport(error.to_string()))
-            }
-            Err(_) => {
-                {
-                    let mut connecting = self.connecting.lock().await;
-                    connecting.remove(&peer);
-                }
-                notify.notify_waiters();
-                Err(DeliveryError::TimedOut)
-            }
-        }
+        logging::log_event(
+            "transport",
+            "connection_dial_started",
+            LogFields::default()
+                .peer_str(peer.to_string())
+                .detail("path_mode", self.config.path_mode.as_str()),
+        );
+        let connection = time::timeout_at(deadline, self.endpoint.connect(addr, CHAT_ALPN))
+            .await
+            .map_err(|_| "connection dial timed out".to_owned())?
+            .map_err(|error| error.to_string())?;
+        self.log_connection_snapshot(
+            "transport",
+            "connection_dial_succeeded",
+            peer,
+            None,
+            &connection,
+            None,
+        );
+        Ok(connection)
     }
 
     async fn dial_addr_for(&self, peer: EndpointId) -> EndpointAddr {
@@ -132,52 +92,84 @@ impl TransportInner {
         EndpointAddr::new(peer)
     }
 
-    pub(super) async fn evict_connection(&self, peer: EndpointId, stale: &Connection) {
-        let mut guard = self.connections.lock().await;
-        let remove = guard
-            .get(&peer)
-            .is_some_and(|cached| cached.stable_id() == stale.stable_id());
-        if remove {
-            if let Some(connection) = guard.remove(&peer) {
-                connection.close(0u32.into(), b"evicted");
-            }
+    pub(super) fn log_connection_snapshot(
+        &self,
+        component: &'static str,
+        event: &'static str,
+        peer: EndpointId,
+        message_id: Option<&MessageId>,
+        connection: &Connection,
+        stream_id: Option<u64>,
+    ) {
+        let mut fields = LogFields::default()
+            .peer_str(peer.to_string())
+            .connection(connection.stable_id())
+            .detail("path_mode", self.config.path_mode.as_str());
+        if let Some(message_id) = message_id {
+            fields = fields.message(message_id);
+        }
+        if let Some(stream_id) = stream_id {
+            fields = fields.stream(stream_id);
+        }
+
+        if let Some(path) = connection.paths().iter().find(|path| path.is_selected()) {
+            let stats = path.stats();
+            let path_kind = if path.is_relay() {
+                "relay"
+            } else if path.is_ip() {
+                "ip"
+            } else {
+                "custom"
+            };
+            fields = fields
+                .detail("path_kind", path_kind)
+                .detail("path_id", path.id().to_string())
+                .detail("rtt_ms", stats.rtt.as_millis().to_string())
+                .detail("udp_tx_bytes", stats.udp_tx.bytes.to_string())
+                .detail("udp_tx_datagrams", stats.udp_tx.datagrams.to_string())
+                .detail("udp_rx_bytes", stats.udp_rx.bytes.to_string())
+                .detail("udp_rx_datagrams", stats.udp_rx.datagrams.to_string())
+                .detail("lost_packets", stats.lost_packets.to_string());
         } else {
-            stale.close(0u32.into(), b"evicted");
+            fields = fields.detail("path_kind", "unknown");
         }
+        logging::log_event(component, event, fields);
     }
 
-    pub(super) async fn cache_incoming_connection(&self, peer: EndpointId, connection: Connection) {
-        if !self.contacts.contains(&peer).await {
-            return;
-        }
-        let mut guard = self.connections.lock().await;
-        guard.entry(peer).or_insert(connection);
+    async fn take_removed_workers(&self, peers: &HashSet<EndpointId>) -> Vec<PeerWorker> {
+        let mut workers = self.workers.lock().await;
+        peers
+            .iter()
+            .filter_map(|peer| workers.remove(peer))
+            .collect()
     }
 
-    async fn remove_cached_connection(&self, peer: EndpointId, connection: &Connection) {
-        let mut guard = self.connections.lock().await;
-        if guard
-            .get(&peer)
-            .is_some_and(|cached| cached.stable_id() == connection.stable_id())
-        {
-            guard.remove(&peer);
-        }
+    async fn take_all_workers(&self) -> Vec<PeerWorker> {
+        let mut workers = self.workers.lock().await;
+        std::mem::take(&mut *workers).into_values().collect()
     }
 }
 
 pub(super) async fn bind(
     secret_key: SecretKey,
     contacts: ContactAllowlist,
+    config: ChatTransportConfig,
 ) -> Result<(ChatTransport, ChatClient, mpsc::Receiver<IncomingText>), ChatStartError> {
     #[cfg(not(test))]
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .alpns(vec![CHAT_ALPN.to_vec()])
-        .bind()
-        .await
-        .map_err(|error| ChatStartError::Bind(error.to_string()))?;
+    let endpoint = {
+        let builder = Endpoint::builder(presets::N0)
+            .secret_key(secret_key)
+            .alpns(vec![CHAT_ALPN.to_vec()]);
+        let builder = match config.path_mode {
+            IrohPathMode::Auto => builder,
+            IrohPathMode::RelayOnly => builder.clear_ip_transports(),
+        };
+        builder
+            .bind()
+            .await
+            .map_err(|error| ChatStartError::Bind(error.to_string()))?
+    };
 
-    // Local unit tests bind loopback only so direct dials never depend on LAN/VPN/routing.
     #[cfg(test)]
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
@@ -189,8 +181,16 @@ pub(super) async fn bind(
         .bind()
         .await
         .map_err(|error| ChatStartError::Bind(error.to_string()))?;
+
     let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_QUEUE_CAPACITY);
-    let inner = Arc::new(TransportInner::new(endpoint, contacts, incoming_tx));
+    logging::log_event(
+        "transport",
+        "transport_bound",
+        LogFields::default()
+            .detail("endpoint_id", endpoint.id().to_string())
+            .detail("path_mode", config.path_mode.as_str()),
+    );
+    let inner = Arc::new(TransportInner::new(endpoint, contacts, incoming_tx, config));
     let accept_task = tokio::spawn(accept_loop(inner.clone()));
     Ok((
         ChatTransport::new(inner.clone(), accept_task),
@@ -203,60 +203,128 @@ async fn accept_loop(inner: Arc<TransportInner>) {
     while let Some(incoming) = inner.endpoint.accept().await {
         let inner = inner.clone();
         tokio::spawn(async move {
-            let Ok(connection) = incoming.await else {
-                return;
+            let connection = match incoming.await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    logging::log_warn(
+                        "transport",
+                        "incoming_connection_failed",
+                        LogFields::default().error(&error),
+                    );
+                    return;
+                }
             };
             let peer = connection.remote_id();
+            let connection_id = connection.stable_id();
+            logging::log_event(
+                "transport",
+                "connection_accepted",
+                LogFields::default()
+                    .peer_str(peer.to_string())
+                    .connection(connection_id)
+                    .direction("inbound"),
+            );
 
             let Ok(permit) = inner.inbound_handlers.clone().try_acquire_owned() else {
+                logging::log_warn(
+                    "transport",
+                    "connection_rejected",
+                    LogFields::default()
+                        .peer_str(peer.to_string())
+                        .connection(connection_id)
+                        .reason("inbound_handler_budget"),
+                );
                 connection.close(0u32.into(), b"handler budget exceeded");
                 return;
             };
 
             if !inner.contacts.contains(&peer).await {
+                logging::log_warn(
+                    "transport",
+                    "connection_rejected",
+                    LogFields::default()
+                        .peer_str(peer.to_string())
+                        .connection(connection_id)
+                        .reason("unknown_contact"),
+                );
                 handle_unauthorised_connection(connection).await;
+                drop(permit);
                 return;
             }
 
-            inner
-                .cache_incoming_connection(peer, connection.clone())
-                .await;
-            let _ = handle_incoming_connection(inner, peer, connection).await;
-            drop(permit);
+            logging::log_event(
+                "transport",
+                "connection_authorized",
+                LogFields::default()
+                    .peer_str(peer.to_string())
+                    .connection(connection_id),
+            );
+            let inner_for_handler = inner.clone();
+            tokio::spawn(async move {
+                let _permit: OwnedSemaphorePermit = permit;
+                handle_incoming_connection(inner_for_handler, peer, connection).await;
+            });
         });
     }
 }
 
 async fn handle_unauthorised_connection(connection: Connection) {
+    let peer = connection.remote_id();
+    let connection_id = connection.stable_id();
     let accepted = time::timeout(INBOUND_STREAM_TIMEOUT, connection.accept_bi()).await;
     let (mut send, mut recv) = match accepted {
         Ok(Ok(pair)) => pair,
         _ => {
+            logging::log_warn(
+                "transport",
+                "unauthorized_connection_closed",
+                LogFields::default()
+                    .peer_str(peer.to_string())
+                    .connection(connection_id)
+                    .reason("request_stream_timeout_or_error"),
+            );
             connection.close(0u32.into(), b"unauthorised");
             return;
         }
     };
-
-    let envelope = match time::timeout(INBOUND_STREAM_TIMEOUT, read_document(&mut recv)).await {
-        Ok(Ok(envelope)) => envelope,
-        _ => {
-            connection.close(0u32.into(), b"unauthorised");
-            return;
-        }
-    };
-
+    let stream_id = u64::from(send.id());
+    let envelope =
+        match time::timeout(INBOUND_STREAM_TIMEOUT, read_single_document(&mut recv)).await {
+            Ok(Ok(envelope)) => envelope,
+            _ => {
+                connection.close(0u32.into(), b"unauthorised");
+                return;
+            }
+        };
     let ChatFrame::Text { message_id, .. } = envelope.frame else {
         connection.close(0u32.into(), b"unauthorised");
         return;
     };
-
+    logging::log_event(
+        "transport",
+        "text_frame_received_from_unknown_contact",
+        LogFields::default()
+            .peer_str(peer.to_string())
+            .connection(connection_id)
+            .message(&message_id)
+            .stream(stream_id),
+    );
     let rejected = WireEnvelope::new(ChatFrame::rejected(
         message_id,
         RejectionCode::UnknownContact,
     ));
-    if write_document(&mut send, &rejected).await.is_ok() {
-        let _ = send.finish();
+    if write_document(&mut send, &rejected).await.is_ok() && send.finish().is_ok() {
         let _ = time::timeout(INBOUND_STREAM_TIMEOUT, send.stopped()).await;
+        logging::log_event(
+            "transport",
+            "rejection_sent",
+            LogFields::default()
+                .peer_str(peer.to_string())
+                .connection(connection_id)
+                .message(&message_id)
+                .stream(stream_id)
+                .reason("unknown_contact"),
+        );
     }
     connection.close(0u32.into(), b"unauthorised");
 }
@@ -265,67 +333,186 @@ async fn handle_incoming_connection(
     inner: Arc<TransportInner>,
     peer: EndpointId,
     connection: Connection,
-) -> Result<(), DeliveryError> {
-    loop {
-        let accepted = time::timeout(INBOUND_STREAM_TIMEOUT, connection.accept_bi()).await;
-        let (mut send, mut recv) = match accepted {
+) {
+    let connection_id = connection.stable_id();
+    let (mut send, mut recv) =
+        match time::timeout(INBOUND_STREAM_TIMEOUT, connection.accept_bi()).await {
             Ok(Ok(pair)) => pair,
-            Ok(Err(_)) | Err(_) => break,
+            Ok(Err(error)) => {
+                logging::log_warn(
+                    "transport",
+                    "incoming_stream_accept_failed",
+                    LogFields::default()
+                        .peer_str(peer.to_string())
+                        .connection(connection_id)
+                        .error(&error),
+                );
+                connection.close(0u32.into(), b"stream accept failed");
+                return;
+            }
+            Err(_) => {
+                logging::log_warn(
+                    "transport",
+                    "incoming_stream_accept_timed_out",
+                    LogFields::default()
+                        .peer_str(peer.to_string())
+                        .connection(connection_id),
+                );
+                connection.close(0u32.into(), b"stream accept timed out");
+                return;
+            }
         };
-
-        let envelope = match time::timeout(INBOUND_STREAM_TIMEOUT, read_document(&mut recv)).await {
+    let stream_id = u64::from(send.id());
+    let envelope =
+        match time::timeout(INBOUND_STREAM_TIMEOUT, read_single_document(&mut recv)).await {
             Ok(Ok(envelope)) => envelope,
-            Ok(Err(_)) | Err(_) => continue,
+            Ok(Err(error)) => {
+                logging::log_warn(
+                    "transport",
+                    "incoming_frame_read_failed",
+                    LogFields::default()
+                        .peer_str(peer.to_string())
+                        .connection(connection_id)
+                        .stream(stream_id)
+                        .error(&error),
+                );
+                connection.close(0u32.into(), b"frame read failed");
+                return;
+            }
+            Err(_) => {
+                logging::log_warn(
+                    "transport",
+                    "incoming_frame_read_timed_out",
+                    LogFields::default()
+                        .peer_str(peer.to_string())
+                        .connection(connection_id)
+                        .stream(stream_id),
+                );
+                connection.close(0u32.into(), b"frame read timed out");
+                return;
+            }
         };
+    let ChatFrame::Text {
+        message_id,
+        sent_at_unix_ms,
+        body,
+    } = envelope.frame
+    else {
+        connection.close(0u32.into(), b"expected text frame");
+        return;
+    };
+    inner.log_connection_snapshot(
+        "transport",
+        "text_frame_received",
+        peer,
+        Some(&message_id),
+        &connection,
+        Some(stream_id),
+    );
 
-        let ChatFrame::Text {
+    if !inner.contacts.contains(&peer).await {
+        let rejected = WireEnvelope::new(ChatFrame::rejected(
             message_id,
-            sent_at_unix_ms,
-            body,
-        } = envelope.frame
-        else {
-            continue;
-        };
-
-        if !inner.contacts.contains(&peer).await {
-            let rejected = WireEnvelope::new(ChatFrame::rejected(
-                message_id,
-                RejectionCode::UnknownContact,
-            ));
-            let _ = write_document(&mut send, &rejected).await;
-            let _ = send.finish();
-            continue;
-        }
-
-        let incoming = IncomingText {
-            peer_id: PeerId::from_canonical(peer.to_string()),
-            message_id,
-            sent_at_unix_ms,
-            body,
-        };
-
-        if inner.incoming_tx.send(incoming).await.is_err() {
-            break;
-        }
-
-        // Re-check after backpressure in case the contact was removed while queued.
-        if !inner.contacts.contains(&peer).await {
-            break;
-        }
-
-        let accepted = WireEnvelope::new(ChatFrame::accepted(message_id, unix_ms_now()));
-        if write_document(&mut send, &accepted).await.is_err() {
-            inner.evict_connection(peer, &connection).await;
-            break;
-        }
-        if send.finish().is_err() {
-            inner.evict_connection(peer, &connection).await;
-            break;
-        }
+            RejectionCode::UnknownContact,
+        ));
+        let _ = write_document(&mut send, &rejected).await;
+        let _ = send.finish();
+        connection.close(0u32.into(), b"contact removed");
+        return;
     }
 
-    inner.remove_cached_connection(peer, &connection).await;
-    Ok(())
+    let incoming = IncomingText {
+        peer_id: PeerId::from_canonical(peer.to_string()),
+        message_id,
+        sent_at_unix_ms,
+        body,
+    };
+    if inner.incoming_tx.send(incoming).await.is_err() {
+        connection.close(0u32.into(), b"session queue closed");
+        return;
+    }
+    if !inner.contacts.contains(&peer).await {
+        connection.close(0u32.into(), b"contact removed");
+        return;
+    }
+
+    let received_at_unix_ms = unix_ms_now();
+    let accepted = WireEnvelope::new(ChatFrame::accepted(message_id, received_at_unix_ms));
+    if let Err(error) = write_document(&mut send, &accepted).await {
+        logging::log_warn(
+            "transport",
+            "receipt_write_failed",
+            LogFields::default()
+                .peer_str(peer.to_string())
+                .connection(connection_id)
+                .message(&message_id)
+                .stream(stream_id)
+                .error(&error),
+        );
+        connection.close(0u32.into(), b"receipt write failed");
+        return;
+    }
+    if let Err(error) = send.finish() {
+        logging::log_warn(
+            "transport",
+            "receipt_finish_failed",
+            LogFields::default()
+                .peer_str(peer.to_string())
+                .connection(connection_id)
+                .message(&message_id)
+                .stream(stream_id)
+                .error(&error),
+        );
+        connection.close(0u32.into(), b"receipt finish failed");
+        return;
+    }
+    inner.log_connection_snapshot(
+        "transport",
+        "receipt_write_finished",
+        peer,
+        Some(&message_id),
+        &connection,
+        Some(stream_id),
+    );
+    match time::timeout(DELIVERY_TIMEOUT, send.stopped()).await {
+        Ok(Ok(_)) => inner.log_connection_snapshot(
+            "transport",
+            "receipt_delivery_confirmed",
+            peer,
+            Some(&message_id),
+            &connection,
+            Some(stream_id),
+        ),
+        Ok(Err(error)) => logging::log_warn(
+            "transport",
+            "receipt_delivery_unconfirmed",
+            LogFields::default()
+                .peer_str(peer.to_string())
+                .connection(connection_id)
+                .message(&message_id)
+                .stream(stream_id)
+                .error(&error),
+        ),
+        Err(_) => logging::log_warn(
+            "transport",
+            "receipt_delivery_unconfirmed",
+            LogFields::default()
+                .peer_str(peer.to_string())
+                .connection(connection_id)
+                .message(&message_id)
+                .stream(stream_id)
+                .reason("confirmation_timeout"),
+        ),
+    }
+    inner.log_connection_snapshot(
+        "transport",
+        "connection_closed",
+        peer,
+        Some(&message_id),
+        &connection,
+        Some(stream_id),
+    );
+    connection.close(0u32.into(), b"delivery complete");
 }
 
 impl ChatTransport {
@@ -340,69 +527,95 @@ impl ChatTransport {
         secret_key: SecretKey,
         contacts: impl IntoIterator<Item = PeerId>,
     ) -> Result<(Self, ChatClient, mpsc::Receiver<IncomingText>), ChatStartError> {
+        Self::start_with_config(secret_key, contacts, ChatTransportConfig::default()).await
+    }
+
+    pub async fn start_with_config(
+        secret_key: SecretKey,
+        contacts: impl IntoIterator<Item = PeerId>,
+        config: ChatTransportConfig,
+    ) -> Result<(Self, ChatClient, mpsc::Receiver<IncomingText>), ChatStartError> {
+        let contacts = contacts.into_iter().collect::<Vec<_>>();
+        logging::log_event(
+            "transport",
+            "transport_start_requested",
+            LogFields::default()
+                .contacts(contacts.len())
+                .detail("path_mode", config.path_mode.as_str()),
+        );
         let contacts = ContactAllowlist::from_peer_ids(contacts)
             .map_err(|error| ChatStartError::InvalidContact(error.to_string()))?;
-        bind(secret_key, contacts).await
+        let result = bind(secret_key, contacts, config).await;
+        if let Err(error) = &result {
+            logging::log_warn(
+                "transport",
+                "transport_start_failed",
+                LogFields::default().error(error),
+            );
+        }
+        result
     }
 
     pub async fn replace_contacts(
         &self,
         contacts: impl IntoIterator<Item = PeerId>,
     ) -> Result<(), ChatStartError> {
+        let contacts = contacts.into_iter().collect::<Vec<_>>();
         let removed = self
             .inner
             .contacts
             .replace_peer_ids(contacts)
             .await
             .map_err(|error| ChatStartError::InvalidContact(error.to_string()))?;
-
-        {
-            let mut connections = self.inner.connections.lock().await;
-            for peer in &removed {
-                if let Some(connection) = connections.remove(peer) {
-                    connection.close(0u32.into(), b"contact removed");
-                }
-            }
+        for worker in self.inner.take_removed_workers(&removed).await {
+            worker.shutdown_drain(DeliveryError::NotAContact).await;
         }
-
-        {
-            let mut workers = self.inner.workers.lock().await;
-            for peer in &removed {
-                if let Some(worker) = workers.remove(peer) {
-                    worker.shutdown_drain(DeliveryError::NotAContact).await;
-                }
-            }
-        }
-
+        logging::log_event(
+            "transport",
+            "contact_allowlist_replaced",
+            LogFields::default().detail("removed_count", removed.len().to_string()),
+        );
         Ok(())
     }
 
     pub async fn shutdown(self) -> Result<(), ChatStartError> {
-        self.accept_task.abort();
-        self.inner.endpoint.close().await;
-
-        let workers = {
-            let mut workers = self.inner.workers.lock().await;
-            std::mem::take(&mut *workers)
-                .into_values()
-                .collect::<Vec<_>>()
-        };
-        for worker in workers {
+        let Self { inner, accept_task } = self;
+        logging::log_event(
+            "transport",
+            "transport_shutdown_requested",
+            LogFields::default(),
+        );
+        accept_task.abort();
+        match accept_task.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => return Err(ChatStartError::Shutdown(error.to_string())),
+        }
+        for worker in inner.take_all_workers().await {
             worker.shutdown_drain(DeliveryError::ShutDown).await;
         }
-
-        self.inner.connections.lock().await.clear();
+        inner.endpoint.close().await;
+        logging::log_event(
+            "transport",
+            "transport_shutdown_completed",
+            LogFields::default(),
+        );
         Ok(())
     }
 
     #[cfg(test)]
-    pub(super) fn endpoint(&self) -> &Endpoint {
+    pub(crate) fn endpoint(&self) -> &Endpoint {
         &self.inner.endpoint
     }
 
     #[cfg(test)]
     pub(super) fn inner(&self) -> &Arc<TransportInner> {
         &self.inner
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_test_route(&self, peer: EndpointId, address: EndpointAddr) {
+        self.inner.test_routes.lock().await.insert(peer, address);
     }
 }
 
@@ -416,17 +629,15 @@ impl ChatClient {
         peer_id: PeerId,
         body: impl Into<String>,
     ) -> Result<DeliveryHandle, DeliveryError> {
+        let body = body.into();
         let endpoint_id =
             peer_id_to_endpoint_id(&peer_id).map_err(|_| DeliveryError::NotAContact)?;
         if !self.inner.contacts.contains(&endpoint_id).await {
             return Err(DeliveryError::NotAContact);
         }
-
         let message_id = random_message_id();
         let sent_at_unix_ms = unix_ms_now();
-        let frame = ChatFrame::text(message_id, sent_at_unix_ms, body)?;
-        let envelope = WireEnvelope::new(frame);
-
+        let envelope = WireEnvelope::new(ChatFrame::text(message_id, sent_at_unix_ms, body)?);
         let worker = {
             let mut workers = self.inner.workers.lock().await;
             workers
@@ -434,30 +645,23 @@ impl ChatClient {
                 .or_insert_with(|| PeerWorker::spawn(endpoint_id, self.inner.clone()))
                 .clone()
         };
-
         let deadline = time::Instant::now() + DELIVERY_TIMEOUT;
+        let queued_at = time::Instant::now();
         let (completion_tx, completion_rx) = oneshot::channel();
-        let completion = Arc::new(Mutex::new(Some(completion_tx)));
-        let cancelled = Arc::new(AtomicBool::new(false));
-
-        spawn_deadline(deadline, completion.clone(), cancelled.clone());
-
-        match worker.try_enqueue(QueuedDelivery {
+        let completion: CompletionSlot = Arc::new(Mutex::new(Some(completion_tx)));
+        let cancellation = Arc::new(super::DeliveryCancellation::new());
+        worker.try_enqueue(QueuedDelivery {
             envelope,
             message_id,
             completion: completion.clone(),
-            cancelled: cancelled.clone(),
+            cancellation: cancellation.clone(),
             deadline,
-        }) {
-            Ok(()) => {}
-            Err(error) => {
-                cancelled.store(true, std::sync::atomic::Ordering::Release);
-                return Err(error);
-            }
-        }
-
+            queued_at,
+        })?;
+        spawn_deadline(deadline, completion, cancellation, endpoint_id, message_id);
         Ok(DeliveryHandle {
             message_id,
+            sent_at_unix_ms,
             completion: completion_rx,
         })
     }
@@ -504,7 +708,6 @@ mod tests {
         let local = SecretKey::from_bytes(&[41; 32]);
         let unknown = PeerId::from_canonical(SecretKey::from_bytes(&[42; 32]).public().to_string());
         let (transport, client, _incoming) = ChatTransport::start(local, []).await.unwrap();
-
         assert!(matches!(
             client.send_text(unknown, "blocked").await,
             Err(DeliveryError::NotAContact)
@@ -518,7 +721,6 @@ mod tests {
         let peer = PeerId::from_canonical(SecretKey::from_bytes(&[44; 32]).public().to_string());
         let (transport, client, _incoming) =
             ChatTransport::start(local, [peer.clone()]).await.unwrap();
-
         transport.replace_contacts([]).await.unwrap();
         assert!(matches!(
             client.send_text(peer, "blocked").await,

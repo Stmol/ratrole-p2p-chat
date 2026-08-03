@@ -16,7 +16,7 @@ use iroh::EndpointId;
 use rand::RngExt;
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, RwLock, oneshot},
+    sync::{Mutex, Notify, RwLock, oneshot},
     task::JoinHandle,
 };
 
@@ -31,6 +31,7 @@ pub const INCOMING_QUEUE_CAPACITY: usize = 64;
 pub const OUTGOING_QUEUE_CAPACITY: usize = 64;
 pub const MAX_INBOUND_HANDLERS: usize = 64;
 pub const INBOUND_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+pub const PATH_MODE_ENV: &str = "RATHOLE_IROH_PATH_MODE";
 
 #[cfg(not(test))]
 pub const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -48,6 +49,44 @@ pub struct ChatTransport {
     accept_task: JoinHandle<()>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrohPathMode {
+    Auto,
+    RelayOnly,
+}
+
+impl IrohPathMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "relay-only" => Ok(Self::RelayOnly),
+            _ => Err(format!(
+                "invalid {PATH_MODE_ENV} value {value:?}; expected auto or relay-only"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::RelayOnly => "relay-only",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChatTransportConfig {
+    pub path_mode: IrohPathMode,
+}
+
+impl Default for ChatTransportConfig {
+    fn default() -> Self {
+        Self {
+            path_mode: IrohPathMode::Auto,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IncomingText {
     pub peer_id: PeerId,
@@ -58,6 +97,7 @@ pub struct IncomingText {
 
 pub struct DeliveryHandle {
     pub message_id: MessageId,
+    pub sent_at_unix_ms: i64,
     completion: oneshot::Receiver<Result<DeliveryReceipt, DeliveryError>>,
 }
 
@@ -75,6 +115,8 @@ pub enum ChatStartError {
     Bind(String),
     #[error("could not close the Iroh chat endpoint: {0}")]
     Shutdown(String),
+    #[error("invalid Iroh path mode: {0}")]
+    InvalidPathMode(String),
 }
 
 #[derive(Clone, Debug, Error)]
@@ -160,6 +202,43 @@ pub(super) async fn resolve_once(
     }
 }
 
+pub(super) struct DeliveryCancellation {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl DeliveryCancellation {
+    pub(super) fn new() -> Self {
+        Self {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    pub(super) fn cancel(&self) -> bool {
+        let won = !self
+            .cancelled
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        self.notify.notify_waiters();
+        won
+    }
+
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(super) async fn wait(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
 #[cfg(test)]
 mod allowlist_tests {
     use iroh::SecretKey;
@@ -188,5 +267,20 @@ mod allowlist_tests {
                 .contains(&peer_id_to_endpoint_id(&valid).unwrap())
                 .await
         );
+    }
+}
+
+#[cfg(test)]
+mod path_mode_tests {
+    use super::*;
+
+    #[test]
+    fn path_mode_parser_rejects_unknown_values() {
+        assert_eq!(IrohPathMode::parse("auto"), Ok(IrohPathMode::Auto));
+        assert_eq!(
+            IrohPathMode::parse("relay-only"),
+            Ok(IrohPathMode::RelayOnly)
+        );
+        assert!(IrohPathMode::parse("direct").is_err());
     }
 }

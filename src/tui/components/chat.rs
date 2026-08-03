@@ -10,7 +10,7 @@ use crate::tui::{
     action::ChatMode,
     components::props::ChatProps,
     config::ChatConfig,
-    model::{MessageSender, MessageView, short_peer_id},
+    model::{DeliveryState, MessageSender, MessageView, short_peer_id},
     theme::{UiTheme, panel_block_with_theme},
 };
 
@@ -89,8 +89,7 @@ fn render_transcript(
     let messages = props.messages;
     if messages.is_empty() {
         frame.render_widget(
-            Paragraph::new("Messaging is not implemented yet")
-                .style(Style::new().fg(theme.muted).bg(theme.panel)),
+            Paragraph::new("No messages yet").style(Style::new().fg(theme.muted).bg(theme.panel)),
             area,
         );
         return;
@@ -260,17 +259,44 @@ fn message_card<'a>(
         .padding(card_padding());
     Paragraph::new(Text::from(vec![
         Line::from(message.body.as_str()),
-        Line::from(vec![
-            Span::styled(author.to_owned(), Style::new().fg(rail).bold()),
-            Span::styled(
-                format!(" · {}", message.timestamp),
-                Style::new().fg(theme.muted),
-            ),
-        ]),
+        Line::from(message_meta_spans(message, author, rail, theme)),
     ]))
     .style(Style::new().fg(theme.text).bg(theme.message))
     .wrap(Wrap { trim: false })
     .block(block)
+}
+
+fn message_meta_spans(
+    message: &MessageView,
+    author: &str,
+    rail: ratatui::style::Color,
+    theme: &UiTheme,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(author.to_owned(), Style::new().fg(rail).bold()),
+        Span::styled(
+            format!(" · {}", message.timestamp),
+            Style::new().fg(theme.muted),
+        ),
+    ];
+    if let Some(label) = delivery_label(message) {
+        spans.push(Span::styled(
+            format!(" · {label}"),
+            Style::new().fg(theme.muted),
+        ));
+    }
+    spans
+}
+
+fn delivery_label(message: &MessageView) -> Option<&'static str> {
+    match message.delivery {
+        Some(DeliveryState::Pending) => Some("Pending"),
+        Some(DeliveryState::Delivered) => Some("Delivered"),
+        Some(DeliveryState::Rejected) => Some("Rejected"),
+        Some(DeliveryState::TimedOut) => Some("Timed out"),
+        Some(DeliveryState::Failed) => Some("Failed"),
+        None => None,
+    }
 }
 
 fn render_rail(frame: &mut Frame, area: Rect, color: ratatui::style::Color) {
@@ -340,7 +366,10 @@ fn crop_draft_left(draft: &str, width: usize) -> String {
 
 fn message_height(message: &MessageView, author: &str, width: u16) -> u16 {
     let width = content_width(width);
-    let header = format!("{author} · {}", message.timestamp);
+    let header = match delivery_label(message) {
+        Some(label) => format!("{author} · {} · {label}", message.timestamp),
+        None => format!("{author} · {}", message.timestamp),
+    };
     let lines = wrapped_line_count(&header, width) + wrapped_line_count(&message.body, width);
     (lines.max(1) as u16).saturating_add(CARD_PAD_Y.saturating_mul(2))
 }
@@ -368,13 +397,13 @@ mod tests {
             action::ChatMode,
             components::props::ChatProps,
             config::UiConfig,
-            model::{ContactView, MessageSender, MessageView},
+            model::{ContactView, DeliveryState, MessageSender, MessageView},
             theme::UiTheme,
         },
     };
 
     #[test]
-    fn empty_chat_explains_messaging_is_not_implemented() {
+    fn empty_chat_invites_live_messaging_without_claiming_persistence() {
         let contact = ContactView::from_peer_id(peer_id_for_test(5));
         let text = render_chat_props(
             ChatProps {
@@ -390,9 +419,29 @@ mod tests {
             70,
             20,
         );
-        assert!(text.contains("Messaging is not implemented yet"));
+        assert!(text.contains("No messages yet"));
+        assert!(!text.contains("Messaging is not implemented"));
         assert!(text.contains(&short_peer_id(&contact.peer_id)));
         assert!(!text.contains("demo"));
+    }
+
+    #[test]
+    fn outgoing_pending_and_delivered_messages_have_distinct_labels() {
+        let pending = message(MessageSender::Local, Some(DeliveryState::Pending));
+        let delivered = message(MessageSender::Local, Some(DeliveryState::Delivered));
+        assert!(render_messages(&[pending]).contains("Pending"));
+        assert!(render_messages(&[delivered]).contains("Delivered"));
+    }
+
+    #[test]
+    fn incoming_messages_have_no_delivery_status_label() {
+        let incoming = message(MessageSender::Contact, None);
+        let text = render_messages(&[incoming]);
+        assert!(!text.contains("Pending"));
+        assert!(!text.contains("Delivered"));
+        assert!(!text.contains("Rejected"));
+        assert!(!text.contains("Timed out"));
+        assert!(!text.contains("Failed"));
     }
 
     #[test]
@@ -577,19 +626,51 @@ mod tests {
         peer_id_from_secret(&iroh::SecretKey::from_bytes(&[byte; 32]))
     }
 
+    fn message(sender: MessageSender, delivery: Option<DeliveryState>) -> MessageView {
+        MessageView {
+            message_id: crate::protocol::MessageId::new([1; 16]),
+            sender,
+            timestamp: "01:01 UTC".into(),
+            body: "hello".into(),
+            delivery,
+        }
+    }
+
     fn sample_messages() -> Vec<MessageView> {
         vec![
             MessageView {
+                message_id: crate::protocol::MessageId::new([1; 16]),
                 sender: MessageSender::Contact,
                 timestamp: "21:06".into(),
                 body: "First sample message".into(),
+                delivery: None,
             },
             MessageView {
+                message_id: crate::protocol::MessageId::new([2; 16]),
                 sender: MessageSender::Local,
                 timestamp: "21:07".into(),
                 body: "Second sample message".into(),
+                delivery: Some(DeliveryState::Delivered),
             },
         ]
+    }
+
+    fn render_messages(messages: &[MessageView]) -> String {
+        let contact = ContactView::from_peer_id(peer_id_for_test(5));
+        render_chat_props(
+            ChatProps {
+                focused: true,
+                mode: ChatMode::Normal,
+                cursor_visible: true,
+                contact: Some(&contact),
+                messages,
+                draft: "",
+                cursor: 0,
+                scroll_offset: 0,
+            },
+            70,
+            20,
+        )
     }
 
     fn render_chat_props(props: ChatProps<'_>, width: u16, height: u16) -> String {

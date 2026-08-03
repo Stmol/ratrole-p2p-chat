@@ -11,3 +11,9 @@
 
 # Local planning artifacts
 /docs/
+.superpowers/
+
+# Local chat diagnostics
+logs/
+*.jsonl
+/target/debug/rathole-logs/

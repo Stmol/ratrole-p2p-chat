@@ -1,16 +1,25 @@
+mod chat_session;
+
+use std::env;
+
 use anyhow::Result;
+use iroh::SecretKey;
 use zeroize::Zeroizing;
 
 use crate::{
     cli::{Cli, Command},
-    domain::{contact::Contact, identity::PeerId},
+    domain::identity::PeerId,
+    logging::{self, LogFields, Logger},
+    network::chat::{ChatTransportConfig, IrohPathMode, PATH_MODE_ENV},
     network::identity::{generate_secret, peer_id_from_secret, restore_secret},
     storage::{
         ContactRepository, DeviceKeyStore, KeyringDeviceKeyStore, TomlContactRepository,
         app_data_dir,
     },
-    tui::{self, ContactView, TuiData, UiCommand, UiEffect, UiEffectHandler},
+    tui::{self, TuiData},
 };
+
+use chat_session::ChatSession;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BootstrapData {
@@ -18,84 +27,32 @@ pub struct BootstrapData {
     pub created: bool,
 }
 
-pub fn bootstrap(keys: &mut impl DeviceKeyStore) -> Result<BootstrapData> {
+fn bootstrap_identity(keys: &mut impl DeviceKeyStore) -> Result<(BootstrapData, SecretKey)> {
     if let Some(bytes) = keys.load()? {
         let secret = restore_secret(bytes.as_ref())?;
-        return Ok(BootstrapData {
-            peer_id: peer_id_from_secret(&secret),
-            created: false,
-        });
+        return Ok((
+            BootstrapData {
+                peer_id: peer_id_from_secret(&secret),
+                created: false,
+            },
+            secret,
+        ));
     }
 
     let secret = generate_secret();
     let bytes = Zeroizing::new(secret.to_bytes());
     keys.save(&bytes)?;
-    Ok(BootstrapData {
-        peer_id: peer_id_from_secret(&secret),
-        created: true,
-    })
+    Ok((
+        BootstrapData {
+            peer_id: peer_id_from_secret(&secret),
+            created: true,
+        },
+        secret,
+    ))
 }
 
-pub struct ApplicationEffectHandler<R> {
-    repository: R,
-}
-
-impl<R> ApplicationEffectHandler<R> {
-    pub fn new(repository: R) -> Self {
-        Self { repository }
-    }
-}
-
-impl<R: ContactRepository> UiEffectHandler for ApplicationEffectHandler<R> {
-    fn handle(&mut self, effect: UiEffect) -> UiCommand {
-        match effect {
-            UiEffect::PersistContact(peer_id) => self.persist_contact(peer_id),
-            UiEffect::RemoveContact(peer_id) => self.remove_contact(peer_id),
-            UiEffect::CopyText(text) => {
-                match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
-                    Ok(()) => UiCommand::ShowStatus("Peer ID copied".to_owned()),
-                    Err(error) => UiCommand::ShowStatus(format!("Could not copy peer ID: {error}")),
-                }
-            }
-        }
-    }
-}
-
-impl<R: ContactRepository> ApplicationEffectHandler<R> {
-    fn persist_contact(&mut self, peer_id: PeerId) -> UiCommand {
-        let mut contacts = match self.repository.load() {
-            Ok(contacts) => contacts,
-            Err(error) => {
-                return UiCommand::ShowStatus(format!("Could not save contact: {error}"));
-            }
-        };
-        if contacts.iter().any(|contact| contact.peer_id() == &peer_id) {
-            return UiCommand::ContactAlreadyExists(peer_id);
-        }
-        contacts.push(Contact::new(peer_id.clone()));
-        match self.repository.replace(&contacts) {
-            Ok(()) => UiCommand::ContactAdded(ContactView::from_peer_id(peer_id)),
-            Err(error) => UiCommand::ShowStatus(format!("Could not save contact: {error}")),
-        }
-    }
-
-    fn remove_contact(&mut self, peer_id: PeerId) -> UiCommand {
-        let mut contacts = match self.repository.load() {
-            Ok(contacts) => contacts,
-            Err(error) => {
-                return UiCommand::ShowStatus(format!("Could not remove contact: {error}"));
-            }
-        };
-        let before = contacts.len();
-        contacts.retain(|contact| contact.peer_id() != &peer_id);
-        if contacts.len() == before {
-            return UiCommand::ShowStatus("Contact was already removed".to_owned());
-        }
-        match self.repository.replace(&contacts) {
-            Ok(()) => UiCommand::ContactRemoved(peer_id),
-            Err(error) => UiCommand::ShowStatus(format!("Could not remove contact: {error}")),
-        }
-    }
+pub fn bootstrap(keys: &mut impl DeviceKeyStore) -> Result<BootstrapData> {
+    Ok(bootstrap_identity(keys)?.0)
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -105,13 +62,64 @@ pub async fn run(cli: Cli) -> Result<()> {
             use std::io::Write;
             std::io::stdout().flush()?;
             let mut keys = KeyringDeviceKeyStore::new()?;
-            let bootstrap = bootstrap(&mut keys)?;
+            let (bootstrap, secret_key) = bootstrap_identity(&mut keys)?;
+            let data_dir = app_data_dir()?;
+            let logger = Logger::init(&data_dir, &bootstrap.peer_id)?;
+            eprintln!("Rathole debug log: {}", logger.path().display());
+            logging::log_event(
+                "application",
+                "identity_ready",
+                LogFields::default().detail("created", bootstrap.created.to_string()),
+            );
             println!();
-            let repository = TomlContactRepository::new(app_data_dir()?.join("contacts.toml"));
+            let repository = TomlContactRepository::new(data_dir.join("contacts.toml"));
             let contacts = repository.load()?;
-            let data = TuiData::from_contacts(bootstrap.peer_id, contacts);
-            let handler = ApplicationEffectHandler::new(repository);
-            tui::run(data, handler, bootstrap.created)
+            logging::log_event(
+                "application",
+                "contacts_loaded",
+                LogFields::default().contacts(contacts.len()),
+            );
+            let data = TuiData::from_contacts(bootstrap.peer_id, contacts.clone());
+            let path_mode = env::var(PATH_MODE_ENV)
+                .map(|value| IrohPathMode::parse(&value))
+                .unwrap_or(Ok(IrohPathMode::Auto))
+                .map_err(anyhow::Error::msg)?;
+            let transport_config = ChatTransportConfig { path_mode };
+            logging::log_event(
+                "application",
+                "chat_path_mode_selected",
+                LogFields::default().detail("path_mode", path_mode.as_str()),
+            );
+            let (effect_tx, effect_rx) = tokio::sync::mpsc::channel(64);
+            let (command_tx, command_rx) = std::sync::mpsc::channel();
+            let session = ChatSession::start_with_config(
+                secret_key,
+                contacts,
+                repository,
+                effect_rx,
+                command_tx,
+                transport_config,
+            )
+            .await?;
+            logging::log_event("application", "chat_session_started", LogFields::default());
+            let tui_result = tui::run(data, effect_tx, command_rx, bootstrap.created);
+            logging::log_event(
+                "application",
+                "tui_finished",
+                LogFields::default().status(if tui_result.is_ok() { "ok" } else { "error" }),
+            );
+            let shutdown_result = session.shutdown().await;
+            logging::log_event(
+                "application",
+                "application_shutdown",
+                LogFields::default().status(if shutdown_result.is_ok() {
+                    "ok"
+                } else {
+                    "error"
+                }),
+            );
+            tui_result?;
+            shutdown_result
         }
         Some(command) => {
             println!(
@@ -136,8 +144,6 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    use crate::domain::contact::Contact;
-
     #[derive(Default)]
     struct MemoryKeyStore {
         secret: RefCell<Option<Zeroizing<[u8; 32]>>>,
@@ -154,30 +160,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct MemoryContactRepository {
-        contacts: RefCell<Vec<Contact>>,
-        fail_replace: RefCell<bool>,
-    }
-
-    impl ContactRepository for MemoryContactRepository {
-        fn load(&self) -> Result<Vec<Contact>> {
-            Ok(self.contacts.borrow().clone())
-        }
-
-        fn replace(&self, contacts: &[Contact]) -> Result<()> {
-            if *self.fail_replace.borrow() {
-                anyhow::bail!("simulated replace failure");
-            }
-            *self.contacts.borrow_mut() = contacts.to_vec();
-            Ok(())
-        }
-    }
-
-    fn peer_id_for_test(byte: u8) -> PeerId {
-        peer_id_from_secret(&iroh::SecretKey::from_bytes(&[byte; 32]))
-    }
-
     #[test]
     fn bootstrap_creates_once_then_reuses_the_same_peer_id() {
         let mut keys = MemoryKeyStore::default();
@@ -190,46 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn persist_contact_writes_before_returning_added() {
-        let repository = MemoryContactRepository::default();
-        let mut handler = ApplicationEffectHandler::new(repository);
-        let peer = peer_id_for_test(30);
-        let command = handler.handle(UiEffect::PersistContact(peer.clone()));
-        assert_eq!(
-            command,
-            UiCommand::ContactAdded(ContactView::from_peer_id(peer.clone()))
-        );
-        assert_eq!(handler.repository.load().unwrap(), vec![Contact::new(peer)]);
-    }
-
-    #[test]
-    fn failed_persist_does_not_claim_contact_was_added() {
-        let repository = MemoryContactRepository {
-            fail_replace: RefCell::new(true),
-            ..Default::default()
-        };
-        let mut handler = ApplicationEffectHandler::new(repository);
-        let command = handler.handle(UiEffect::PersistContact(peer_id_for_test(31)));
-        match command {
-            UiCommand::ShowStatus(message) => {
-                assert!(message.contains("Could not save contact"));
-            }
-            other => panic!("expected status, got {other:?}"),
-        }
-        assert!(handler.repository.load().unwrap().is_empty());
-    }
-
-    #[test]
-    fn duplicate_persist_returns_already_exists_without_rewriting() {
-        let peer = peer_id_for_test(32);
-        let repository = MemoryContactRepository {
-            contacts: RefCell::new(vec![Contact::new(peer.clone())]),
-            ..Default::default()
-        };
-        let mut handler = ApplicationEffectHandler::new(repository);
-        assert_eq!(
-            handler.handle(UiEffect::PersistContact(peer.clone())),
-            UiCommand::ContactAlreadyExists(peer)
-        );
+    fn bootstrap_identity_returns_the_same_peer_id_as_its_in_memory_secret() {
+        let mut keys = MemoryKeyStore::default();
+        let (bootstrap, secret) = bootstrap_identity(&mut keys).unwrap();
+        assert_eq!(bootstrap.peer_id, peer_id_from_secret(&secret));
     }
 }

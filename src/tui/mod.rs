@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::logging::{self, LogFields};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind},
@@ -22,12 +23,13 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-pub(crate) use app::{TuiApp, UiCommand, UiEffect, UiEffectHandler};
-pub(crate) use model::{ContactView, TuiData};
+pub(crate) use app::{TuiApp, UiCommand, UiEffect};
+pub(crate) use model::{ContactView, DeliveryState, TuiData};
 
 pub(crate) fn run(
     data: TuiData,
-    mut effect_handler: impl UiEffectHandler,
+    effect_tx: tokio::sync::mpsc::Sender<UiEffect>,
+    command_rx: std::sync::mpsc::Receiver<UiCommand>,
     created: bool,
 ) -> Result<()> {
     enable_raw_mode()?;
@@ -47,7 +49,7 @@ pub(crate) fn run(
         }
     };
 
-    let result = run_loop(&mut terminal, data, &mut effect_handler, created);
+    let result = run_loop(&mut terminal, data, effect_tx, command_rx, created);
     let restore_result = restore_terminal(&mut terminal);
 
     match (result, restore_result) {
@@ -60,7 +62,8 @@ pub(crate) fn run(
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     data: TuiData,
-    effect_handler: &mut impl UiEffectHandler,
+    effect_tx: tokio::sync::mpsc::Sender<UiEffect>,
+    command_rx: std::sync::mpsc::Receiver<UiCommand>,
     created: bool,
 ) -> Result<()> {
     // Brief startup frame before accepting input.
@@ -85,25 +88,30 @@ fn run_loop(
     let mut next_blink = Instant::now() + blink_interval;
 
     while !app.should_quit {
+        drain_commands(&mut app, &command_rx);
         terminal.draw(|frame| ui::render(frame, &app))?;
-        let timeout = next_blink.saturating_duration_since(Instant::now());
+        let timeout = next_blink
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(50));
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let action = input::action_for_key(app.input_context(), key);
                     app.update(action);
-                    dispatch_effect(&mut app, effect_handler);
+                    dispatch_effect(&mut app, &effect_tx);
+                    drain_commands(&mut app, &command_rx);
                     next_blink = Instant::now() + blink_interval;
                 }
                 Event::Paste(text) => {
                     app.update(action::Action::Paste(text));
-                    dispatch_effect(&mut app, effect_handler);
+                    dispatch_effect(&mut app, &effect_tx);
+                    drain_commands(&mut app, &command_rx);
                     next_blink = Instant::now() + blink_interval;
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
             }
-        } else {
+        } else if Instant::now() >= next_blink {
             app.toggle_cursor_blink();
             next_blink = Instant::now() + blink_interval;
         }
@@ -111,10 +119,46 @@ fn run_loop(
     Ok(())
 }
 
-fn dispatch_effect(app: &mut TuiApp, effect_handler: &mut impl UiEffectHandler) {
-    if let Some(effect) = app.take_effect() {
-        let command = effect_handler.handle(effect);
-        app.apply_command(command);
+const COMMAND_DRAIN_LIMIT: usize = 64;
+
+fn drain_commands(app: &mut TuiApp, command_rx: &std::sync::mpsc::Receiver<UiCommand>) {
+    for _ in 0..COMMAND_DRAIN_LIMIT {
+        match command_rx.try_recv() {
+            Ok(command) => app.apply_command(command),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+            | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+fn dispatch_effect(app: &mut TuiApp, effect_tx: &tokio::sync::mpsc::Sender<UiEffect>) {
+    let Some(effect) = app.take_effect() else {
+        return;
+    };
+    let (event, fields) = match &effect {
+        UiEffect::PersistContact(peer_id) => (
+            "ui_effect_persist_contact_dispatched",
+            LogFields::default().peer(peer_id),
+        ),
+        UiEffect::RemoveContact(peer_id) => (
+            "ui_effect_remove_contact_dispatched",
+            LogFields::default().peer(peer_id),
+        ),
+        UiEffect::CopyText(text) => (
+            "ui_effect_copy_text_dispatched",
+            LogFields::default().detail("text_bytes", text.len().to_string()),
+        ),
+        UiEffect::SendText { peer_id, body } => (
+            "ui_effect_send_text_dispatched",
+            LogFields::default().peer(peer_id).body_bytes(body.len()),
+        ),
+    };
+    logging::log_event("tui", event, fields);
+    if effect_tx.try_send(effect).is_err() {
+        logging::log_warn("tui", "ui_effect_dropped", LogFields::default());
+        app.apply_command(UiCommand::ShowStatus(
+            "Application is busy; try again".into(),
+        ));
     }
 }
 
@@ -123,4 +167,33 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_commands_applies_every_pending_command_before_the_next_frame() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = TuiApp::demo();
+        tx.send(UiCommand::ShowStatus("first".into())).unwrap();
+        tx.send(UiCommand::ShowStatus("second".into())).unwrap();
+        drain_commands(&mut app, &rx);
+        assert_eq!(app.status(), Some("second"));
+    }
+
+    #[test]
+    fn drain_commands_caps_work_per_tick_and_leaves_the_remainder() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = TuiApp::demo();
+        for index in 1..=65 {
+            tx.send(UiCommand::ShowStatus(format!("status-{index}")))
+                .unwrap();
+        }
+        drain_commands(&mut app, &rx);
+        assert_eq!(app.status(), Some("status-64"));
+        drain_commands(&mut app, &rx);
+        assert_eq!(app.status(), Some("status-65"));
+    }
 }

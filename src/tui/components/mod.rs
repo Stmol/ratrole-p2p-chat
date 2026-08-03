@@ -1,5 +1,6 @@
 mod chat;
 mod details;
+pub(crate) mod editor;
 mod footer;
 pub(crate) mod overlay;
 pub(crate) mod props;

@@ -15,7 +15,3 @@ impl PeerId {
         &self.0
     }
 }
-
-/// A transport-specific device identity, backed by a separate Iroh key.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct DeviceId(pub String);
