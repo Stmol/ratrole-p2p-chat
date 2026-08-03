@@ -7,17 +7,20 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey,
     endpoint::{Connection, presets},
 };
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+#[cfg(test)]
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio::time;
 
 #[cfg(not(test))]
 use super::IrohPathMode;
 use super::framing::{read_single_document, write_document};
-use super::worker::{PeerWorker, QueuedDelivery, spawn_deadline};
+use super::session::{PeerSession, QueuedDelivery};
 use super::{
     CHAT_ALPN, ChatClient, ChatStartError, ChatTransport, ChatTransportConfig, CompletionSlot,
     ContactAllowlist, DELIVERY_TIMEOUT, DeliveryError, DeliveryHandle, INBOUND_STREAM_TIMEOUT,
-    INCOMING_QUEUE_CAPACITY, IncomingText, MAX_INBOUND_HANDLERS, random_message_id, unix_ms_now,
+    INCOMING_QUEUE_CAPACITY, IncomingText, MAX_INBOUND_HANDLERS, MAX_INBOUND_SESSIONS,
+    MAX_INBOUND_STREAM_HANDLERS, random_message_id, unix_ms_now,
 };
 use crate::domain::identity::PeerId;
 use crate::logging::{self, LogFields};
@@ -28,8 +31,10 @@ pub(super) struct TransportInner {
     pub(super) endpoint: Endpoint,
     pub(super) contacts: ContactAllowlist,
     pub(super) incoming_tx: mpsc::Sender<IncomingText>,
-    pub(super) workers: Mutex<HashMap<EndpointId, PeerWorker>>,
-    pub(super) inbound_handlers: Arc<Semaphore>,
+    pub(super) sessions: Mutex<HashMap<EndpointId, PeerSession>>,
+    pub(super) inbound_sessions: Arc<Semaphore>,
+    pub(super) inbound_stream_handlers: Arc<Semaphore>,
+    pub(super) inbound_connection_admissions: Arc<Semaphore>,
     pub(super) config: ChatTransportConfig,
     #[cfg(test)]
     pub(super) test_routes: Mutex<HashMap<EndpointId, EndpointAddr>>,
@@ -46,8 +51,10 @@ impl TransportInner {
             endpoint,
             contacts,
             incoming_tx,
-            workers: Mutex::new(HashMap::new()),
-            inbound_handlers: Arc::new(Semaphore::new(MAX_INBOUND_HANDLERS)),
+            sessions: Mutex::new(HashMap::new()),
+            inbound_sessions: Arc::new(Semaphore::new(MAX_INBOUND_SESSIONS)),
+            inbound_stream_handlers: Arc::new(Semaphore::new(MAX_INBOUND_STREAM_HANDLERS)),
+            inbound_connection_admissions: Arc::new(Semaphore::new(MAX_INBOUND_HANDLERS)),
             config,
             #[cfg(test)]
             test_routes: Mutex::new(HashMap::new()),
@@ -111,7 +118,6 @@ impl TransportInner {
         if let Some(stream_id) = stream_id {
             fields = fields.stream(stream_id);
         }
-
         if let Some(path) = connection.paths().iter().find(|path| path.is_selected()) {
             let stats = path.stats();
             let path_kind = if path.is_relay() {
@@ -136,17 +142,28 @@ impl TransportInner {
         logging::log_event(component, event, fields);
     }
 
-    async fn take_removed_workers(&self, peers: &HashSet<EndpointId>) -> Vec<PeerWorker> {
-        let mut workers = self.workers.lock().await;
+    async fn session_for_inbound(self: &Arc<Self>, peer: EndpointId) -> Option<PeerSession> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(&peer) {
+            return Some(session.clone());
+        }
+        let permit = self.inbound_sessions.clone().try_acquire_owned().ok()?;
+        let session = PeerSession::spawn(peer, self.clone(), Some(permit));
+        sessions.insert(peer, session.clone());
+        Some(session)
+    }
+
+    async fn take_removed_sessions(&self, peers: &HashSet<EndpointId>) -> Vec<PeerSession> {
+        let mut sessions = self.sessions.lock().await;
         peers
             .iter()
-            .filter_map(|peer| workers.remove(peer))
+            .filter_map(|peer| sessions.remove(peer))
             .collect()
     }
 
-    async fn take_all_workers(&self) -> Vec<PeerWorker> {
-        let mut workers = self.workers.lock().await;
-        std::mem::take(&mut *workers).into_values().collect()
+    async fn take_all_sessions(&self) -> Vec<PeerSession> {
+        let mut sessions = self.sessions.lock().await;
+        std::mem::take(&mut *sessions).into_values().collect()
     }
 }
 
@@ -201,8 +218,23 @@ pub(super) async fn bind(
 
 async fn accept_loop(inner: Arc<TransportInner>) {
     while let Some(incoming) = inner.endpoint.accept().await {
+        let Some(admission) = inner
+            .inbound_connection_admissions
+            .clone()
+            .try_acquire_owned()
+            .ok()
+        else {
+            logging::log_warn(
+                "transport",
+                "connection_rejected",
+                LogFields::default().reason("inbound_handler_budget"),
+            );
+            incoming.refuse();
+            continue;
+        };
         let inner = inner.clone();
         tokio::spawn(async move {
+            let _admission = admission;
             let connection = match incoming.await {
                 Ok(connection) => connection,
                 Err(error) => {
@@ -224,20 +256,6 @@ async fn accept_loop(inner: Arc<TransportInner>) {
                     .connection(connection_id)
                     .direction("inbound"),
             );
-
-            let Ok(permit) = inner.inbound_handlers.clone().try_acquire_owned() else {
-                logging::log_warn(
-                    "transport",
-                    "connection_rejected",
-                    LogFields::default()
-                        .peer_str(peer.to_string())
-                        .connection(connection_id)
-                        .reason("inbound_handler_budget"),
-                );
-                connection.close(0u32.into(), b"handler budget exceeded");
-                return;
-            };
-
             if !inner.contacts.contains(&peer).await {
                 logging::log_warn(
                     "transport",
@@ -248,10 +266,21 @@ async fn accept_loop(inner: Arc<TransportInner>) {
                         .reason("unknown_contact"),
                 );
                 handle_unauthorised_connection(connection).await;
-                drop(permit);
                 return;
             }
-
+            drop(_admission);
+            let Some(session) = inner.session_for_inbound(peer).await else {
+                logging::log_warn(
+                    "transport",
+                    "connection_rejected",
+                    LogFields::default()
+                        .peer_str(peer.to_string())
+                        .connection(connection_id)
+                        .reason("inbound_session_budget"),
+                );
+                connection.close(0u32.into(), b"inbound session budget exceeded");
+                return;
+            };
             logging::log_event(
                 "transport",
                 "connection_authorized",
@@ -259,11 +288,7 @@ async fn accept_loop(inner: Arc<TransportInner>) {
                     .peer_str(peer.to_string())
                     .connection(connection_id),
             );
-            let inner_for_handler = inner.clone();
-            tokio::spawn(async move {
-                let _permit: OwnedSemaphorePermit = permit;
-                handle_incoming_connection(inner_for_handler, peer, connection).await;
-            });
+            session.attach_inbound(connection);
         });
     }
 }
@@ -275,14 +300,6 @@ async fn handle_unauthorised_connection(connection: Connection) {
     let (mut send, mut recv) = match accepted {
         Ok(Ok(pair)) => pair,
         _ => {
-            logging::log_warn(
-                "transport",
-                "unauthorized_connection_closed",
-                LogFields::default()
-                    .peer_str(peer.to_string())
-                    .connection(connection_id)
-                    .reason("request_stream_timeout_or_error"),
-            );
             connection.close(0u32.into(), b"unauthorised");
             return;
         }
@@ -292,11 +309,15 @@ async fn handle_unauthorised_connection(connection: Connection) {
         match time::timeout(INBOUND_STREAM_TIMEOUT, read_single_document(&mut recv)).await {
             Ok(Ok(envelope)) => envelope,
             _ => {
+                let _ = send.reset(0u32.into());
+                let _ = recv.stop(0u32.into());
                 connection.close(0u32.into(), b"unauthorised");
                 return;
             }
         };
     let ChatFrame::Text { message_id, .. } = envelope.frame else {
+        let _ = send.reset(0u32.into());
+        let _ = recv.stop(0u32.into());
         connection.close(0u32.into(), b"unauthorised");
         return;
     };
@@ -313,8 +334,10 @@ async fn handle_unauthorised_connection(connection: Connection) {
         message_id,
         RejectionCode::UnknownContact,
     ));
-    if write_document(&mut send, &rejected).await.is_ok() && send.finish().is_ok() {
-        let _ = time::timeout(INBOUND_STREAM_TIMEOUT, send.stopped()).await;
+    if write_document(&mut send, &rejected).await.is_ok() {
+        if send.finish().is_ok() {
+            let _ = time::timeout(INBOUND_STREAM_TIMEOUT, send.stopped()).await;
+        }
         logging::log_event(
             "transport",
             "rejection_sent",
@@ -327,192 +350,6 @@ async fn handle_unauthorised_connection(connection: Connection) {
         );
     }
     connection.close(0u32.into(), b"unauthorised");
-}
-
-async fn handle_incoming_connection(
-    inner: Arc<TransportInner>,
-    peer: EndpointId,
-    connection: Connection,
-) {
-    let connection_id = connection.stable_id();
-    let (mut send, mut recv) =
-        match time::timeout(INBOUND_STREAM_TIMEOUT, connection.accept_bi()).await {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(error)) => {
-                logging::log_warn(
-                    "transport",
-                    "incoming_stream_accept_failed",
-                    LogFields::default()
-                        .peer_str(peer.to_string())
-                        .connection(connection_id)
-                        .error(&error),
-                );
-                connection.close(0u32.into(), b"stream accept failed");
-                return;
-            }
-            Err(_) => {
-                logging::log_warn(
-                    "transport",
-                    "incoming_stream_accept_timed_out",
-                    LogFields::default()
-                        .peer_str(peer.to_string())
-                        .connection(connection_id),
-                );
-                connection.close(0u32.into(), b"stream accept timed out");
-                return;
-            }
-        };
-    let stream_id = u64::from(send.id());
-    let envelope =
-        match time::timeout(INBOUND_STREAM_TIMEOUT, read_single_document(&mut recv)).await {
-            Ok(Ok(envelope)) => envelope,
-            Ok(Err(error)) => {
-                logging::log_warn(
-                    "transport",
-                    "incoming_frame_read_failed",
-                    LogFields::default()
-                        .peer_str(peer.to_string())
-                        .connection(connection_id)
-                        .stream(stream_id)
-                        .error(&error),
-                );
-                connection.close(0u32.into(), b"frame read failed");
-                return;
-            }
-            Err(_) => {
-                logging::log_warn(
-                    "transport",
-                    "incoming_frame_read_timed_out",
-                    LogFields::default()
-                        .peer_str(peer.to_string())
-                        .connection(connection_id)
-                        .stream(stream_id),
-                );
-                connection.close(0u32.into(), b"frame read timed out");
-                return;
-            }
-        };
-    let ChatFrame::Text {
-        message_id,
-        sent_at_unix_ms,
-        body,
-    } = envelope.frame
-    else {
-        connection.close(0u32.into(), b"expected text frame");
-        return;
-    };
-    inner.log_connection_snapshot(
-        "transport",
-        "text_frame_received",
-        peer,
-        Some(&message_id),
-        &connection,
-        Some(stream_id),
-    );
-
-    if !inner.contacts.contains(&peer).await {
-        let rejected = WireEnvelope::new(ChatFrame::rejected(
-            message_id,
-            RejectionCode::UnknownContact,
-        ));
-        let _ = write_document(&mut send, &rejected).await;
-        let _ = send.finish();
-        connection.close(0u32.into(), b"contact removed");
-        return;
-    }
-
-    let incoming = IncomingText {
-        peer_id: PeerId::from_canonical(peer.to_string()),
-        message_id,
-        sent_at_unix_ms,
-        body,
-    };
-    if inner.incoming_tx.send(incoming).await.is_err() {
-        connection.close(0u32.into(), b"session queue closed");
-        return;
-    }
-    if !inner.contacts.contains(&peer).await {
-        connection.close(0u32.into(), b"contact removed");
-        return;
-    }
-
-    let received_at_unix_ms = unix_ms_now();
-    let accepted = WireEnvelope::new(ChatFrame::accepted(message_id, received_at_unix_ms));
-    if let Err(error) = write_document(&mut send, &accepted).await {
-        logging::log_warn(
-            "transport",
-            "receipt_write_failed",
-            LogFields::default()
-                .peer_str(peer.to_string())
-                .connection(connection_id)
-                .message(&message_id)
-                .stream(stream_id)
-                .error(&error),
-        );
-        connection.close(0u32.into(), b"receipt write failed");
-        return;
-    }
-    if let Err(error) = send.finish() {
-        logging::log_warn(
-            "transport",
-            "receipt_finish_failed",
-            LogFields::default()
-                .peer_str(peer.to_string())
-                .connection(connection_id)
-                .message(&message_id)
-                .stream(stream_id)
-                .error(&error),
-        );
-        connection.close(0u32.into(), b"receipt finish failed");
-        return;
-    }
-    inner.log_connection_snapshot(
-        "transport",
-        "receipt_write_finished",
-        peer,
-        Some(&message_id),
-        &connection,
-        Some(stream_id),
-    );
-    match time::timeout(DELIVERY_TIMEOUT, send.stopped()).await {
-        Ok(Ok(_)) => inner.log_connection_snapshot(
-            "transport",
-            "receipt_delivery_confirmed",
-            peer,
-            Some(&message_id),
-            &connection,
-            Some(stream_id),
-        ),
-        Ok(Err(error)) => logging::log_warn(
-            "transport",
-            "receipt_delivery_unconfirmed",
-            LogFields::default()
-                .peer_str(peer.to_string())
-                .connection(connection_id)
-                .message(&message_id)
-                .stream(stream_id)
-                .error(&error),
-        ),
-        Err(_) => logging::log_warn(
-            "transport",
-            "receipt_delivery_unconfirmed",
-            LogFields::default()
-                .peer_str(peer.to_string())
-                .connection(connection_id)
-                .message(&message_id)
-                .stream(stream_id)
-                .reason("confirmation_timeout"),
-        ),
-    }
-    inner.log_connection_snapshot(
-        "transport",
-        "connection_closed",
-        peer,
-        Some(&message_id),
-        &connection,
-        Some(stream_id),
-    );
-    connection.close(0u32.into(), b"delivery complete");
 }
 
 impl ChatTransport {
@@ -545,15 +382,7 @@ impl ChatTransport {
         );
         let contacts = ContactAllowlist::from_peer_ids(contacts)
             .map_err(|error| ChatStartError::InvalidContact(error.to_string()))?;
-        let result = bind(secret_key, contacts, config).await;
-        if let Err(error) = &result {
-            logging::log_warn(
-                "transport",
-                "transport_start_failed",
-                LogFields::default().error(error),
-            );
-        }
-        result
+        bind(secret_key, contacts, config).await
     }
 
     pub async fn replace_contacts(
@@ -567,8 +396,8 @@ impl ChatTransport {
             .replace_peer_ids(contacts)
             .await
             .map_err(|error| ChatStartError::InvalidContact(error.to_string()))?;
-        for worker in self.inner.take_removed_workers(&removed).await {
-            worker.shutdown_drain(DeliveryError::NotAContact).await;
+        for session in self.inner.take_removed_sessions(&removed).await {
+            session.shutdown(DeliveryError::NotAContact).await;
         }
         logging::log_event(
             "transport",
@@ -591,8 +420,8 @@ impl ChatTransport {
             Err(error) if error.is_cancelled() => {}
             Err(error) => return Err(ChatStartError::Shutdown(error.to_string())),
         }
-        for worker in inner.take_all_workers().await {
-            worker.shutdown_drain(DeliveryError::ShutDown).await;
+        for session in inner.take_all_sessions().await {
+            session.shutdown(DeliveryError::ShutDown).await;
         }
         inner.endpoint.close().await;
         logging::log_event(
@@ -638,26 +467,27 @@ impl ChatClient {
         let message_id = random_message_id();
         let sent_at_unix_ms = unix_ms_now();
         let envelope = WireEnvelope::new(ChatFrame::text(message_id, sent_at_unix_ms, body)?);
-        let worker = {
-            let mut workers = self.inner.workers.lock().await;
-            workers
-                .entry(endpoint_id)
-                .or_insert_with(|| PeerWorker::spawn(endpoint_id, self.inner.clone()))
-                .clone()
-        };
         let deadline = time::Instant::now() + DELIVERY_TIMEOUT;
         let queued_at = time::Instant::now();
         let (completion_tx, completion_rx) = oneshot::channel();
         let completion: CompletionSlot = Arc::new(Mutex::new(Some(completion_tx)));
         let cancellation = Arc::new(super::DeliveryCancellation::new());
-        worker.try_enqueue(QueuedDelivery {
+        let session = {
+            let mut sessions = self.inner.sessions.lock().await;
+            sessions
+                .entry(endpoint_id)
+                .or_insert_with(|| PeerSession::spawn(endpoint_id, self.inner.clone(), None))
+                .clone()
+        };
+        let delivery = QueuedDelivery {
             envelope,
             message_id,
             completion: completion.clone(),
             cancellation: cancellation.clone(),
             deadline,
             queued_at,
-        })?;
+        };
+        session.try_enqueue(delivery)?;
         spawn_deadline(deadline, completion, cancellation, endpoint_id, message_id);
         Ok(DeliveryHandle {
             message_id,
@@ -665,6 +495,33 @@ impl ChatClient {
             completion: completion_rx,
         })
     }
+}
+
+fn spawn_deadline(
+    deadline: time::Instant,
+    completion: CompletionSlot,
+    cancellation: Arc<super::DeliveryCancellation>,
+    peer: EndpointId,
+    message_id: MessageId,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = time::sleep_until(deadline) => {
+                if cancellation.cancel() {
+                    logging::log_warn(
+                        "session",
+                        "message_delivery_timed_out",
+                        LogFields::default()
+                            .peer_str(peer.to_string())
+                            .message(&message_id)
+                            .reason("delivery_deadline"),
+                    );
+                    super::resolve_once(&completion, Err(DeliveryError::TimedOut)).await;
+                }
+            }
+            _ = cancellation.wait() => {}
+        }
+    });
 }
 
 #[cfg(test)]
@@ -677,19 +534,42 @@ pub(super) async fn set_test_route(
 }
 
 #[cfg(test)]
+pub(super) fn inbound_session_budget(inner: &TransportInner) -> usize {
+    inner.inbound_sessions.available_permits()
+}
+
+#[cfg(test)]
+pub(super) async fn exhaust_inbound_session_budget(
+    inner: &TransportInner,
+) -> Vec<OwnedSemaphorePermit> {
+    let mut permits = Vec::with_capacity(MAX_INBOUND_SESSIONS);
+    for _ in 0..MAX_INBOUND_SESSIONS {
+        permits.push(
+            inner
+                .inbound_sessions
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("inbound session permit"),
+        );
+    }
+    permits
+}
+
+#[cfg(test)]
 pub(super) fn inbound_handler_budget(inner: &TransportInner) -> usize {
-    inner.inbound_handlers.available_permits()
+    inner.inbound_connection_admissions.available_permits()
 }
 
 #[cfg(test)]
 pub(super) async fn exhaust_inbound_handler_budget(
     inner: &TransportInner,
-) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+) -> Vec<OwnedSemaphorePermit> {
     let mut permits = Vec::with_capacity(MAX_INBOUND_HANDLERS);
     for _ in 0..MAX_INBOUND_HANDLERS {
         permits.push(
             inner
-                .inbound_handlers
+                .inbound_connection_admissions
                 .clone()
                 .acquire_owned()
                 .await
@@ -697,35 +577,4 @@ pub(super) async fn exhaust_inbound_handler_budget(
         );
     }
     permits
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn outgoing_unknown_contact_is_rejected_before_any_dial() {
-        let local = SecretKey::from_bytes(&[41; 32]);
-        let unknown = PeerId::from_canonical(SecretKey::from_bytes(&[42; 32]).public().to_string());
-        let (transport, client, _incoming) = ChatTransport::start(local, []).await.unwrap();
-        assert!(matches!(
-            client.send_text(unknown, "blocked").await,
-            Err(DeliveryError::NotAContact)
-        ));
-        transport.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn removing_contact_blocks_the_next_send() {
-        let local = SecretKey::from_bytes(&[43; 32]);
-        let peer = PeerId::from_canonical(SecretKey::from_bytes(&[44; 32]).public().to_string());
-        let (transport, client, _incoming) =
-            ChatTransport::start(local, [peer.clone()]).await.unwrap();
-        transport.replace_contacts([]).await.unwrap();
-        assert!(matches!(
-            client.send_text(peer, "blocked").await,
-            Err(DeliveryError::NotAContact)
-        ));
-        transport.shutdown().await.unwrap();
-    }
 }

@@ -4,7 +4,10 @@ use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr, endpoint::presets};
 use tokio::sync::{mpsc, oneshot};
 
 use super::framing::{read_document, write_document};
-use super::transport::{exhaust_inbound_handler_budget, inbound_handler_budget, set_test_route};
+use super::transport::{
+    exhaust_inbound_handler_budget, exhaust_inbound_session_budget, inbound_handler_budget,
+    inbound_session_budget, set_test_route,
+};
 use super::{
     CHAT_ALPN, ChatClient, ChatTransport, DeliveryError, INBOUND_STREAM_TIMEOUT, IncomingText,
     OUTGOING_QUEUE_CAPACITY,
@@ -123,55 +126,27 @@ async fn authorised_contacts_exchange_unicode_text_and_an_ack() {
 }
 
 #[tokio::test]
-async fn subsequent_delivery_after_idle_uses_a_new_connection() {
-    let bob_secret = SecretKey::from_bytes(&[102; 32]);
-    let alice_secret = SecretKey::from_bytes(&[101; 32]);
-    let alice_id = peer_id_from_secret(&alice_secret);
-    let mut bob = local_peer(bob_secret, [alice_id.clone()]).await;
-    let alice = Endpoint::builder(presets::N0)
-        .secret_key(alice_secret)
-        .alpns(vec![CHAT_ALPN.to_vec()])
-        .relay_mode(iroh::RelayMode::Disabled)
-        .clear_ip_transports()
-        .bind_addr("127.0.0.1:0")
-        .unwrap()
-        .bind()
+async fn subsequent_delivery_after_idle_keeps_the_connection_alive() {
+    let (alice, mut bob) = local_pair().await;
+    let first = alice
+        .client
+        .send_text(bob.peer_id.clone(), "before idle")
         .await
         .unwrap();
-    let connection = alice
-        .connect(direct_loopback_addr(&bob.transport).await, CHAT_ALPN)
-        .await
-        .unwrap();
+    assert_eq!(bob.incoming.recv().await.unwrap().body, "before idle");
+    first.wait().await.unwrap();
 
-    connection.close(0u32.into(), b"one delivery per connection");
     tokio::time::sleep(INBOUND_STREAM_TIMEOUT + Duration::from_millis(250)).await;
 
-    let connection = alice
-        .connect(direct_loopback_addr(&bob.transport).await, CHAT_ALPN)
+    let second = alice
+        .client
+        .send_text(bob.peer_id.clone(), "after idle")
         .await
         .unwrap();
+    assert_eq!(bob.incoming.recv().await.unwrap().body, "after idle");
+    second.wait().await.unwrap();
 
-    let message_id = MessageId::new([103; 16]);
-    let (mut send, mut recv) = connection.open_bi().await.unwrap();
-    write_document(
-        &mut send,
-        &WireEnvelope::new(ChatFrame::text(message_id, 1, "after idle").unwrap()),
-    )
-    .await
-    .unwrap();
-    send.finish().unwrap();
-
-    let incoming = tokio::time::timeout(Duration::from_secs(2), bob.incoming.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(incoming.message_id, message_id);
-    let receipt = read_document(&mut recv).await.unwrap();
-    assert!(
-        matches!(receipt.frame, ChatFrame::Accepted { message_id: id, .. } if id == message_id)
-    );
-
-    alice.close().await;
+    alice.transport.shutdown().await.unwrap();
     bob.transport.shutdown().await.unwrap();
 }
 
@@ -224,7 +199,7 @@ async fn receipt_survives_slow_remote_read() {
 }
 
 #[tokio::test]
-async fn one_peer_worker_preserves_queue_order_across_two_message_streams() {
+async fn one_peer_session_preserves_queue_order_across_two_message_streams() {
     let (alice, mut bob) = local_pair().await;
     let first = alice
         .client
@@ -494,7 +469,7 @@ async fn oversized_declared_length_produces_no_incoming_message() {
 }
 
 #[tokio::test]
-async fn wrong_receipt_frame_is_a_protocol_violation_and_evicts() {
+async fn wrong_receipt_frame_resets_only_the_stream_and_keeps_the_session() {
     let bob_secret = SecretKey::from_bytes(&[82; 32]);
     let alice_secret = SecretKey::from_bytes(&[81; 32]);
     let bob_peer_id = peer_id_from_secret(&bob_secret);
@@ -526,7 +501,15 @@ async fn wrong_receipt_frame_is_a_protocol_violation_and_evicts() {
             send.finish().unwrap();
             // Keep the connection alive until the peer has read the reply.
             let _ = send.stopped().await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let envelope = read_document(&mut recv).await.unwrap();
+            let ChatFrame::Text { message_id, .. } = envelope.frame else {
+                panic!("expected text");
+            };
+            let accepted = WireEnvelope::new(ChatFrame::accepted(message_id, 1));
+            write_document(&mut send, &accepted).await.unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
             connection
         })
     };
@@ -564,26 +547,6 @@ async fn wrong_receipt_frame_is_a_protocol_violation_and_evicts() {
         matches!(result, Err(DeliveryError::ProtocolViolation)),
         "unexpected delivery result: {result:?}"
     );
-    accept.await.unwrap();
-
-    let accept2 = {
-        let bob = bob.clone();
-        tokio::spawn(async move {
-            let incoming = bob.accept().await.unwrap();
-            let connection = incoming.await.unwrap();
-            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
-            let envelope = read_document(&mut recv).await.unwrap();
-            let ChatFrame::Text { message_id, .. } = envelope.frame else {
-                panic!("expected text");
-            };
-            let accepted = WireEnvelope::new(ChatFrame::accepted(message_id, 1));
-            write_document(&mut send, &accepted).await.unwrap();
-            send.finish().unwrap();
-            let _ = send.stopped().await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            connection
-        })
-    };
     let second = alice
         .client
         .send_text(bob_peer_id, "again")
@@ -592,7 +555,7 @@ async fn wrong_receipt_frame_is_a_protocol_violation_and_evicts() {
         .wait()
         .await;
     assert!(second.is_ok());
-    accept2.await.unwrap();
+    accept.await.unwrap();
 
     alice.transport.shutdown().await.unwrap();
     bob.close().await;
@@ -758,14 +721,16 @@ async fn hung_dial_times_out_within_the_delivery_deadline() {
 }
 
 #[tokio::test]
-async fn inbound_handler_budget_rejects_extra_connections() {
-    let alice = local_peer(SecretKey::from_bytes(&[95; 32]), []).await;
+async fn inbound_session_budget_rejects_extra_connections() {
+    let intruder_secret = SecretKey::from_bytes(&[96; 32]);
+    let intruder_id = peer_id_from_secret(&intruder_secret);
+    let alice = local_peer(SecretKey::from_bytes(&[95; 32]), [intruder_id]).await;
     let alice_addr = direct_loopback_addr(&alice.transport).await;
-    let _budget = exhaust_inbound_handler_budget(alice.transport.inner()).await;
-    assert_eq!(inbound_handler_budget(alice.transport.inner()), 0);
+    let _budget = exhaust_inbound_session_budget(alice.transport.inner()).await;
+    assert_eq!(inbound_session_budget(alice.transport.inner()), 0);
 
     let intruder = Endpoint::builder(presets::N0)
-        .secret_key(SecretKey::from_bytes(&[96; 32]))
+        .secret_key(intruder_secret)
         .alpns(vec![CHAT_ALPN.to_vec()])
         .relay_mode(iroh::RelayMode::Disabled)
         .clear_ip_transports()
@@ -780,6 +745,41 @@ async fn inbound_handler_budget_rejects_extra_connections() {
     assert!(
         connection.open_bi().await.is_err(),
         "server should close connections when the inbound handler budget is exhausted"
+    );
+
+    alice.transport.shutdown().await.unwrap();
+    intruder.close().await;
+}
+
+#[tokio::test]
+async fn inbound_handler_budget_rejects_connections_before_handshake() {
+    let alice = local_peer(SecretKey::from_bytes(&[97; 32]), []).await;
+    let alice_addr = direct_loopback_addr(&alice.transport).await;
+    let _budget = exhaust_inbound_handler_budget(alice.transport.inner()).await;
+    assert_eq!(inbound_handler_budget(alice.transport.inner()), 0);
+
+    let intruder = Endpoint::builder(presets::N0)
+        .secret_key(SecretKey::from_bytes(&[98; 32]))
+        .alpns(vec![CHAT_ALPN.to_vec()])
+        .relay_mode(iroh::RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        intruder.connect(alice_addr, CHAT_ALPN),
+    )
+    .await
+    .expect("connection refusal should not hang")
+    .map(|_| ())
+    .is_err();
+    assert!(
+        result,
+        "server should refuse connections when the inbound handler budget is exhausted"
     );
 
     alice.transport.shutdown().await.unwrap();

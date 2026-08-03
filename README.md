@@ -43,11 +43,11 @@ The first client is a Rust terminal application. Future compatible clients may b
 
 - `src/network/chat/` provides the Iroh ALPN `rathole/chat/1` transport. Launching the TUI starts exactly one transport for that session and shuts it down on exit.
 - Delivery is allowed only to locally stored contacts. Incoming authorisation uses the authenticated Iroh `EndpointId`, not an identity field inside CBOR.
-- Each delivery creates one Iroh connection and one bidirectional stream. The stream carries exactly one `Text → Accepted | Rejected` exchange and is closed after its terminal receipt; connections are not cached.
+- Each contact has one long-lived Iroh connection when reachable. Every message uses a new bidirectional stream carrying exactly one `Text → Accepted | Rejected` exchange; a healthy connection stays open across messages and idle periods.
 - Each stream document has a four-byte big-endian length prefix and a 32 KiB maximum CBOR body. Incoming and per-peer outgoing queues are capped at 64 messages. A full per-peer outgoing queue returns `QueueFull` immediately instead of blocking the caller.
-- Messages from one sender worker are attempted FIFO. Every message gets a fresh connection, so timeouts and simultaneous bidirectional sends do not provide a durable global order. `connection_id` is local to one process; correlate two machine logs with `message_id`.
+- Messages are attempted FIFO per peer on a bounded session queue. One connection multiplexes independent message streams, and simultaneous bidirectional sends are allowed. `connection_id` is local to one process; correlate two machine logs with `message_id` and `stream_id`.
 - Delivery is online-only with a 30-second local deadline that starts when `send_text` accepts a message into the per-peer outgoing queue and covers queueing, dial, and stream I/O. There is no persistence, retry, deduplication, sequence number, offline mailbox, or presence claim yet.
-- Removing a contact cancels its active one-message connection, drains that peer's outbound worker, and cancels queued deliveries with `NotAContact`. Inbound connections from non-contacts are limited to a bounded handler budget with stream timeouts.
+- Removing a contact closes that peer session and cancels its active stream and queued deliveries with `NotAContact`. Inbound sessions and stream handlers have separate bounded budgets; a stream protocol error resets only that stream and does not evict a healthy connection.
 
 ## Run
 
@@ -92,9 +92,9 @@ inside each client. Message bodies, private keys, and device secrets are not
 written to the diagnostic log; only message sizes and protocol metadata are
 recorded. JSONL schema version 2 also records `stream_id`, path mode, selected
 path kind/id, RTT, and UDP byte/datagram/loss counters when Iroh exposes them.
-`receipt_write_finished`, `receipt_delivery_confirmed`, and `receipt_received`
-are separate events; a local stream `finish` is not treated as delivery
-confirmation.
+`receipt_write_finished` and `receipt_received` are separate events. A local
+stream `finish` is not treated as proof that the remote runtime read the
+receipt; there is no third receipt acknowledgement in CBOR v1.
 
 Useful quick filters:
 

@@ -1,6 +1,6 @@
 mod framing;
+mod session;
 mod transport;
-mod worker;
 
 #[cfg(test)]
 mod tests;
@@ -29,7 +29,10 @@ use transport::TransportInner;
 pub const CHAT_ALPN: &[u8] = b"rathole/chat/1";
 pub const INCOMING_QUEUE_CAPACITY: usize = 64;
 pub const OUTGOING_QUEUE_CAPACITY: usize = 64;
-pub const MAX_INBOUND_HANDLERS: usize = 64;
+pub const MAX_INBOUND_SESSIONS: usize = 64;
+pub const MAX_INBOUND_STREAM_HANDLERS: usize = 64;
+#[doc(hidden)]
+pub const MAX_INBOUND_HANDLERS: usize = MAX_INBOUND_SESSIONS;
 pub const INBOUND_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PATH_MODE_ENV: &str = "RATHOLE_IROH_PATH_MODE";
 
