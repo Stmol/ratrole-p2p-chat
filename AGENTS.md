@@ -22,7 +22,6 @@
 
 ## Security
 
-- Never persist recovery phrases, private keys, or device secrets in plaintext files, logs, snapshots, or tests.
 - Store future device secrets in the platform keychain and keep only public configuration in the application data directory.
 - Do not claim that a network, relay, identity, or encrypted payload operation happened unless the implementation actually performed it.
 

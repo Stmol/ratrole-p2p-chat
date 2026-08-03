@@ -13,8 +13,8 @@ use crate::{
     network::chat::{ChatTransportConfig, IrohPathMode, PATH_MODE_ENV},
     network::identity::{generate_secret, peer_id_from_secret, restore_secret},
     storage::{
-        ContactRepository, DeviceKeyStore, KeyringDeviceKeyStore, TomlContactRepository,
-        app_data_dir,
+        ContactRepository, DeviceKeyStore, STORAGE_PROFILE_ENV, StorageProfile,
+        TomlContactRepository,
     },
     tui::{self, TuiData},
 };
@@ -27,7 +27,9 @@ pub struct BootstrapData {
     pub created: bool,
 }
 
-fn bootstrap_identity(keys: &mut impl DeviceKeyStore) -> Result<(BootstrapData, SecretKey)> {
+fn bootstrap_identity<K: DeviceKeyStore + ?Sized>(
+    keys: &mut K,
+) -> Result<(BootstrapData, SecretKey)> {
     if let Some(bytes) = keys.load()? {
         let secret = restore_secret(bytes.as_ref())?;
         return Ok((
@@ -51,7 +53,7 @@ fn bootstrap_identity(keys: &mut impl DeviceKeyStore) -> Result<(BootstrapData, 
     ))
 }
 
-pub fn bootstrap(keys: &mut impl DeviceKeyStore) -> Result<BootstrapData> {
+pub fn bootstrap<K: DeviceKeyStore + ?Sized>(keys: &mut K) -> Result<BootstrapData> {
     Ok(bootstrap_identity(keys)?.0)
 }
 
@@ -61,9 +63,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             print!("Creating your peer identity…");
             use std::io::Write;
             std::io::stdout().flush()?;
-            let mut keys = KeyringDeviceKeyStore::new()?;
-            let (bootstrap, secret_key) = bootstrap_identity(&mut keys)?;
-            let data_dir = app_data_dir()?;
+            let profile_value = env::var(STORAGE_PROFILE_ENV).ok();
+            let storage_profile = StorageProfile::from_env_value(profile_value.as_deref())?;
+            let data_dir = storage_profile.data_dir()?;
+            let mut keys = storage_profile.device_key_store(&data_dir)?;
+            let (bootstrap, secret_key) = bootstrap_identity(keys.as_mut())?;
             let logger = Logger::init(&data_dir, &bootstrap.peer_id)?;
             eprintln!("Rathole debug log: {}", logger.path().display());
             logging::log_event(
@@ -176,5 +180,18 @@ mod tests {
         let mut keys = MemoryKeyStore::default();
         let (bootstrap, secret) = bootstrap_identity(&mut keys).unwrap();
         assert_eq!(bootstrap.peer_id, peer_id_from_secret(&secret));
+    }
+
+    #[test]
+    fn bootstrap_with_file_store_reuses_the_same_peer_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut keys = crate::storage::FileDeviceKeyStore::new(directory.path().join("device.key"));
+
+        let first = bootstrap(&mut keys).unwrap();
+        let second = bootstrap(&mut keys).unwrap();
+
+        assert!(first.created);
+        assert!(!second.created);
+        assert_eq!(first.peer_id, second.peer_id);
     }
 }
