@@ -21,10 +21,10 @@ The first client is a Rust terminal application. Future compatible clients may b
 
 ## Quick start
 
-Install the stable Rust toolchain, then launch the TUI:
+Install the stable Rust toolchain, then launch the signed development TUI:
 
 ```sh
-cargo run
+just dev
 ```
 
 Useful local commands:
@@ -36,7 +36,9 @@ just run
 just dev
 ```
 
-`just dev` uses a separate file-backed development identity. See the [development guide](docs/development.md) for storage, validation, and OpenSpec instructions.
+`just dev` builds and signs the debug binary before using its separate
+file-backed development identity. See the [development guide](docs/development.md)
+for signing, storage, validation, and OpenSpec instructions.
 
 ## Basic controls
 

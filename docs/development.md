@@ -22,17 +22,20 @@ The repository shortcuts also configure diagnostic log locations:
 
 ```sh
 just run          # alias: just r
-just dev          # alias: just d; use the file-backed development identity
-just dev-signed   # alias: just ds; build, sign, and run the dev binary
+just dev          # alias: just d; build, sign, and run the dev binary
 just run-relay    # alias: just rr; force relay-only Iroh paths
 ```
 
 ### Signed development launch on macOS
 
-The plain `cargo run`, `just run`, and `just dev` commands use the normal Cargo
-debug executable. macOS may treat each rebuilt ad hoc executable as a new
-network process because its code hash changes. Use `just dev-signed` when
-iterating with the macOS Application Firewall or LuLu enabled.
+`just dev` is the normal local development command. It builds
+`target/debug/rathole`, signs it, and starts the same file with the file-backed
+development identity. Signing prevents macOS from treating every rebuilt
+debug executable as a new network process because its code hash changes.
+
+The direct `cargo run` and `just run` commands remain raw Cargo launches. Use
+`just dev` for routine local iteration with the macOS Application Firewall or
+LuLu enabled.
 
 Create a persistent local code-signing identity in Keychain Access with the
 certificate type `Code Signing` and the name `Rathole Local Development`, or
@@ -42,20 +45,18 @@ use an existing Apple signing identity. Verify the available identities with:
 security find-identity -v -p codesigning
 ```
 
-`just dev-signed` builds `target/debug/rathole`, signs it with
-`codesign`, and then starts the same file using the file-backed development
-identity. The default certificate name and code-signing identifier can be
-overridden when needed:
+The default certificate name and code-signing identifier can be overridden when
+needed:
 
 ```sh
-RATHOLE_CODESIGN_IDENTITY="Apple Development: Developer Name (TEAMID)" just dev-signed
-RATHOLE_CODESIGN_IDENTIFIER="org.rathole.rathole.dev" just dev-signed
+APPLE_CODESIGN_IDENTITY="Apple Development: Developer Name (TEAMID)" just dev
+RATHOLE_CODESIGN_IDENTIFIER="org.rathole.rathole.dev" just dev
 ```
 
-Approve the first signed run in the macOS firewall and create the matching
-allow rule in LuLu. Keep the signing certificate and identifier stable across
-rebuilds; do not replace this with an ad hoc `codesign --sign -` signature,
-because that does not provide a persistent code-signing identity.
+Approve the first signed `just dev` run in the macOS firewall and create the
+matching allow rule in LuLu. Keep the signing certificate and identifier stable
+across rebuilds; do not replace this with an ad hoc `codesign --sign -`
+signature, because that does not provide a persistent code-signing identity.
 
 Use the standard repository checks before handing off a change:
 
