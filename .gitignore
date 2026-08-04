@@ -10,7 +10,8 @@
 *.swo
 
 # Local planning artifacts
-/docs/
+/docs/superpowers
+/docs/chats
 .superpowers/
 
 # Local chat diagnostics
