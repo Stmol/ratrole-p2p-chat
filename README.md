@@ -7,7 +7,8 @@ The first client is a Rust terminal application. Future compatible clients may b
 ## Product model
 
 - The current MVP peer ID is this installation’s Iroh `EndpointId`.
-- The Iroh device secret is held by the operating system keychain, never in plaintext configuration.
+- The normal `rathole` and `just run` profiles hold the Iroh device secret in the operating system keychain.
+- The `just dev` profile intentionally uses a local file-backed development identity; see [Development mode](#development-mode).
 - Contacts are local and one-way. Adding a contact only validates and stores an EndpointId locally.
 - Rathole defines a versioned bootstrap relay set, including the Iroh N0 preset used to bootstrap transport, but the current relay list UI starts empty. Relay persistence remains future work; in-memory relay add/remove/toggle already exists in the TUI.
 - A durable multi-device `UserPeerId`, recovery phrases, and presence exchange are future subsystems.
@@ -24,7 +25,7 @@ The first client is a Rust terminal application. Future compatible clients may b
 ## Identity and contacts (MVP)
 
 - The displayed peer ID is this installation’s Iroh EndpointId.
-- The device secret is held by the OS keychain and must not be copied or shared.
+- The normal profile keeps the device secret in the OS keychain and it must not be copied or shared.
 - Use Contacts → x → Copy my ID to share the public ID.
 - Use Contacts → x → Add contact to paste another Iroh EndpointId.
 - Adding a contact only validates and saves the ID locally. It does not verify that the peer is online, reachable, or has accepted the contact.
@@ -65,6 +66,29 @@ cargo test
 just run
 # equivalent shortcut: just r
 ```
+
+## Development mode
+
+Use the file-backed development profile when running local tests:
+
+```sh
+just dev
+# equivalent shortcut: just d
+```
+
+This profile sets `RATHOLE_STORAGE_PROFILE=dev` and does not access the OS
+Keychain. It stores the development identity and contacts here:
+
+```text
+~/.config/rathole/device.key
+~/.config/rathole/contacts.toml
+```
+
+`device.key` contains exactly 32 raw bytes and is created with owner-only
+permissions (`0600` on Unix). It is intentionally not encrypted: do not copy,
+share, commit, or synchronize this file. The first `just dev` run creates a
+separate development peer ID; deleting `device.key` creates a new one. Dev
+diagnostic logs remain under `target/debug/rathole-logs/`.
 
 ## Chat diagnostics
 
@@ -135,7 +159,7 @@ src/
   cli.rs                    Command-line parsing
   domain/                   Transport-independent product concepts
   network/                  Iroh EndpointId / SecretKey boundary and chat transport
-  storage/                  Keychain device secret and contacts.toml repository
+  storage/                  Keychain/file device secret and contacts.toml repository
   tui/                      Ratatui presentation and input loop
     components/             Typed panel renderers and local UI state
       editor.rs             Multibyte-safe chat draft editing helper
