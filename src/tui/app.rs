@@ -1,4 +1,4 @@
-use crate::domain::{identity::PeerId, relay::RelaySource};
+use crate::domain::{connection::ContactConnectionState, identity::PeerId, relay::RelaySource};
 use crate::logging::{self, LogFields};
 use crate::network::identity::parse_endpoint_id;
 use crate::protocol::MessageId;
@@ -56,6 +56,10 @@ pub(crate) enum UiCommand {
         message_id: MessageId,
         sent_at_unix_ms: i64,
         body: String,
+    },
+    PeerConnectionStateChanged {
+        peer_id: PeerId,
+        state: ContactConnectionState,
     },
 }
 
@@ -399,43 +403,69 @@ impl TuiApp {
                         (MenuAction::CopyOwnId, "Copy my ID", true),
                         (MenuAction::AddContact, "Add contact", true),
                     ];
-                    if let Some(contact) = self.active_contact() {
-                        actions.push((
-                            MenuAction::RemoveContact(contact.id()),
-                            "Remove contact",
-                            true,
-                        ));
+                    if let Some(id) = self.active_contact().map(ContactView::id) {
+                        let action = MenuAction::RemoveContact(id);
+                        let removable = self.menu_action_enabled(&action);
+                        actions.push((action, "Remove contact", removable));
                     }
                     Some(actions)
                 }
-                SidebarTab::Relays => self.active_relay().map(|relay| {
-                    vec![
-                        (
-                            MenuAction::ToggleRelay(relay.id),
-                            if relay.enabled {
-                                "Disable relay"
-                            } else {
-                                "Enable relay"
-                            },
-                            true,
-                        ),
-                        (
-                            MenuAction::RemoveRelay(relay.id),
-                            "Remove relay",
-                            matches!(relay.source, RelaySource::User),
-                        ),
-                    ]
-                }),
+                SidebarTab::Relays => {
+                    let relay = self
+                        .active_relay()
+                        .map(|relay| (relay.id, relay.enabled, MenuAction::RemoveRelay(relay.id)));
+                    relay.map(|(id, enabled, remove)| {
+                        let removable = self.menu_action_enabled(&remove);
+                        vec![
+                            (
+                                MenuAction::ToggleRelay(id),
+                                if enabled {
+                                    "Disable relay"
+                                } else {
+                                    "Enable relay"
+                                },
+                                true,
+                            ),
+                            (remove, "Remove relay", removable),
+                        ]
+                    })
+                }
             },
-            Panel::Chat => self
-                .active_contact()
-                .map(|contact| vec![(MenuAction::ClearChat(contact.id()), "Clear chat", true)]),
+            Panel::Chat => {
+                let action = self
+                    .active_contact()
+                    .map(|contact| MenuAction::ClearChat(contact.id()));
+                action.map(|action| {
+                    let clearable = self.menu_action_enabled(&action);
+                    vec![(action, "Clear chat", clearable)]
+                })
+            }
         };
         if let Some(actions) = actions {
             self.overlay.overlay = Some(Overlay::Context(ContextMenu {
                 actions,
                 selected: 0,
             }));
+        }
+    }
+
+    fn menu_action_enabled(&self, action: &MenuAction) -> bool {
+        match action {
+            MenuAction::CopyOwnId | MenuAction::AddContact | MenuAction::ToggleRelay(_) => true,
+            MenuAction::RemoveContact(id) | MenuAction::ClearChat(id) => self
+                .data
+                .contacts
+                .iter()
+                .find(|contact| &contact.id() == id)
+                .is_some_and(|contact| {
+                    contact.connection_state != ContactConnectionState::Connecting
+                }),
+            MenuAction::RemoveRelay(id) => self
+                .data
+                .relays
+                .iter()
+                .find(|relay| relay.id == *id)
+                .is_some_and(|relay| matches!(relay.source, RelaySource::User)),
         }
     }
 
@@ -469,7 +499,10 @@ impl TuiApp {
             },
             Action::Activate => match self.overlay.overlay.clone() {
                 Some(Overlay::Context(menu)) => {
-                    if let Some((action, _, true)) = menu.actions.get(menu.selected).cloned() {
+                    if let Some((action, _, _)) = menu.actions.get(menu.selected).cloned() {
+                        if !self.menu_action_enabled(&action) {
+                            return;
+                        }
                         match action {
                             MenuAction::CopyOwnId => {
                                 self.pending_effect = Some(UiEffect::CopyText(
@@ -497,7 +530,9 @@ impl TuiApp {
                     action,
                     confirm_selected: true,
                 }) => {
-                    self.apply_menu_action(action);
+                    if self.menu_action_enabled(&action) {
+                        self.apply_menu_action(action);
+                    }
                     self.overlay.overlay = None;
                 }
                 Some(Overlay::Confirm { .. }) => self.overlay.overlay = None,
@@ -611,6 +646,17 @@ impl TuiApp {
                 }
             }
             UiCommand::ClearChat(id) => {
+                let blocked = self
+                    .data
+                    .contacts
+                    .iter()
+                    .find(|contact| contact.id() == id)
+                    .is_some_and(|contact| {
+                        contact.connection_state == ContactConnectionState::Connecting
+                    });
+                if blocked {
+                    return;
+                }
                 if let Some(messages) = self.data.chats.get_mut(&id) {
                     messages.clear();
                     self.chat.scroll.insert(id, 0);
@@ -637,6 +683,16 @@ impl TuiApp {
                 sent_at_unix_ms,
                 body,
             } => self.append_incoming_message(peer_id, message_id, sent_at_unix_ms, body),
+            UiCommand::PeerConnectionStateChanged { peer_id, state } => {
+                if let Some(contact) = self
+                    .data
+                    .contacts
+                    .iter_mut()
+                    .find(|contact| contact.peer_id == peer_id)
+                {
+                    contact.connection_state = state;
+                }
+            }
         }
     }
 
@@ -760,6 +816,24 @@ impl TuiApp {
         if body.is_empty() {
             return;
         }
+        match self
+            .data
+            .contacts
+            .iter()
+            .find(|contact| contact.peer_id == peer_id)
+            .map(|contact| contact.connection_state)
+        {
+            Some(ContactConnectionState::Connecting) => {
+                self.status = Some("Peer connection is being checked".to_owned());
+                return;
+            }
+            Some(ContactConnectionState::NotConnected) => {
+                self.status = Some("Peer is not connected".to_owned());
+                return;
+            }
+            Some(ContactConnectionState::Connected) => {}
+            None => return,
+        }
         self.chat.pending_send.insert(peer_id.clone());
         self.pending_effect = Some(UiEffect::SendText { peer_id, body });
     }
@@ -851,6 +925,10 @@ fn log_ui_command_applied(command: &UiCommand) {
                 .message(message_id)
                 .body_bytes(body.len())
                 .sent_at(*sent_at_unix_ms),
+        ),
+        UiCommand::PeerConnectionStateChanged { peer_id, state } => (
+            "ui_command_peer_connection_state_changed_applied",
+            LogFields::default().peer(peer_id).status(state.as_str()),
         ),
     };
     logging::log_event("tui", event, fields);
@@ -996,7 +1074,9 @@ mod tests {
 
     #[test]
     fn submit_emits_send_effect_but_keeps_draft_until_queue_admission() {
-        let mut app = app_with_contacts(vec![ContactView::from_peer_id(peer_id_for_test(1))]);
+        let mut contact = ContactView::from_peer_id(peer_id_for_test(1));
+        contact.connection_state = ContactConnectionState::Connected;
+        let mut app = app_with_contacts(vec![contact]);
         enter_draft(&mut app, "hello");
         app.update(Action::SubmitDraft);
         assert_eq!(
@@ -1007,6 +1087,16 @@ mod tests {
             })
         );
         assert_eq!(app.chat_props().draft, "hello");
+    }
+
+    #[test]
+    fn submit_while_not_connected_keeps_draft_and_skips_effect() {
+        let mut app = app_with_contacts(vec![ContactView::from_peer_id(peer_id_for_test(1))]);
+        enter_draft(&mut app, "hello");
+        app.update(Action::SubmitDraft);
+        assert_eq!(app.take_effect(), None);
+        assert_eq!(app.chat_props().draft, "hello");
+        assert_eq!(app.status(), Some("Peer is not connected"));
     }
 
     #[test]
@@ -1148,6 +1238,105 @@ mod tests {
     }
 
     #[test]
+    fn clear_chat_while_connecting_keeps_history() {
+        let peer = peer_id_for_test(37);
+        let mut contact = ContactView::from_peer_id(peer.clone());
+        contact.connection_state = ContactConnectionState::Connecting;
+        let mut app = app_with_contacts(vec![contact]);
+        seed_chat(&mut app, &peer, "keep me");
+
+        app.apply_command(UiCommand::ClearChat(peer.clone()));
+
+        assert_eq!(app.data.chats[&peer].len(), 1);
+        assert_eq!(app.data.chats[&peer][0].body, "keep me");
+    }
+
+    #[test]
+    fn open_clear_chat_menu_blocks_after_connected_becomes_connecting() {
+        let peer = peer_id_for_test(38);
+        let mut contact = ContactView::from_peer_id(peer.clone());
+        contact.connection_state = ContactConnectionState::Connected;
+        let mut app = app_with_contacts(vec![contact]);
+        seed_chat(&mut app, &peer, "keep me");
+        app.focus = Panel::Chat;
+
+        app.update(Action::OpenContextMenu);
+        app.apply_command(UiCommand::PeerConnectionStateChanged {
+            peer_id: peer.clone(),
+            state: ContactConnectionState::Connecting,
+        });
+        app.update(Action::Activate);
+
+        assert!(matches!(app.overlay.overlay, Some(Overlay::Context(_))));
+        assert_eq!(app.data.chats[&peer].len(), 1);
+    }
+
+    #[test]
+    fn open_clear_chat_menu_allows_action_after_connecting_becomes_connected() {
+        let peer = peer_id_for_test(39);
+        let mut contact = ContactView::from_peer_id(peer.clone());
+        contact.connection_state = ContactConnectionState::Connecting;
+        let mut app = app_with_contacts(vec![contact]);
+        seed_chat(&mut app, &peer, "clear me");
+        app.focus = Panel::Chat;
+
+        app.update(Action::OpenContextMenu);
+        app.apply_command(UiCommand::PeerConnectionStateChanged {
+            peer_id: peer.clone(),
+            state: ContactConnectionState::Connected,
+        });
+        app.update(Action::Activate);
+        assert!(matches!(
+            app.overlay.overlay,
+            Some(Overlay::Confirm {
+                action: MenuAction::ClearChat(_),
+                ..
+            })
+        ));
+        app.update(Action::Navigate(1));
+        app.update(Action::Activate);
+
+        assert!(app.data.chats[&peer].is_empty());
+        assert!(!app.overlay_open());
+    }
+
+    #[test]
+    fn peer_connection_state_updates_existing_contact_and_ignores_unknown_peers() {
+        let peer = peer_id_for_test(1);
+        let unknown = peer_id_for_test(2);
+        let mut app = app_with_contacts(vec![ContactView::from_peer_id(peer.clone())]);
+        assert_eq!(
+            app.data.contacts[0].connection_state,
+            ContactConnectionState::NotConnected
+        );
+
+        app.apply_command(UiCommand::PeerConnectionStateChanged {
+            peer_id: peer.clone(),
+            state: ContactConnectionState::Connecting,
+        });
+        assert_eq!(
+            app.data.contacts[0].connection_state,
+            ContactConnectionState::Connecting
+        );
+
+        app.apply_command(UiCommand::PeerConnectionStateChanged {
+            peer_id: peer.clone(),
+            state: ContactConnectionState::Connected,
+        });
+        assert_eq!(
+            app.data.contacts[0].connection_state,
+            ContactConnectionState::Connected
+        );
+
+        app.apply_command(UiCommand::PeerConnectionStateChanged {
+            peer_id: unknown,
+            state: ContactConnectionState::Connected,
+        });
+        assert_eq!(app.data.contacts.len(), 1);
+        assert_eq!(app.data.contacts[0].peer_id, peer);
+    }
+
+    #[test]
     fn late_events_for_removed_contact_do_not_recreate_local_history() {
         let peer = peer_id_for_test(1);
         let mut app = app_with_contacts(vec![ContactView::from_peer_id(peer.clone())]);
@@ -1198,6 +1387,19 @@ mod tests {
         for ch in body.chars() {
             app.update(Action::InsertChar(ch));
         }
+    }
+
+    fn seed_chat(app: &mut TuiApp, peer: &PeerId, body: &str) {
+        app.data.chats.insert(
+            peer.clone(),
+            vec![MessageView {
+                message_id: MessageId::new([7; 16]),
+                sender: MessageSender::Local,
+                timestamp: "00:00 UTC".into(),
+                body: body.into(),
+                delivery: Some(DeliveryState::Delivered),
+            }],
+        );
     }
 
     fn incoming(peer_id: PeerId, body: &str) -> UiCommand {

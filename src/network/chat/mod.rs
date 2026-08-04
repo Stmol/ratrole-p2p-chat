@@ -20,7 +20,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::domain::identity::PeerId;
+use crate::domain::{connection::ContactConnectionState, identity::PeerId};
 use crate::network::identity::peer_id_to_endpoint_id;
 use crate::protocol::{MessageId, RejectionCode, ValidationError};
 
@@ -33,6 +33,7 @@ pub const MAX_INBOUND_SESSIONS: usize = 64;
 pub const MAX_INBOUND_STREAM_HANDLERS: usize = 64;
 #[doc(hidden)]
 pub const MAX_INBOUND_HANDLERS: usize = MAX_INBOUND_SESSIONS;
+pub const MAX_OUTBOUND_DIALS: usize = 8;
 pub const INBOUND_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PATH_MODE_ENV: &str = "RATHOLE_IROH_PATH_MODE";
 
@@ -41,6 +42,12 @@ pub const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 pub const DELIVERY_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[cfg(not(test))]
+pub const CONNECTION_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+pub const CONNECTION_DIAL_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct ChatClient {
@@ -80,12 +87,14 @@ impl IrohPathMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChatTransportConfig {
     pub path_mode: IrohPathMode,
+    pub dial_timeout: Duration,
 }
 
 impl Default for ChatTransportConfig {
     fn default() -> Self {
         Self {
             path_mode: IrohPathMode::Auto,
+            dial_timeout: CONNECTION_DIAL_TIMEOUT,
         }
     }
 }
@@ -96,6 +105,12 @@ pub struct IncomingText {
     pub message_id: MessageId,
     pub sent_at_unix_ms: i64,
     pub body: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerConnectionEvent {
+    pub peer_id: PeerId,
+    pub state: ContactConnectionState,
 }
 
 pub struct DeliveryHandle {
@@ -126,6 +141,10 @@ pub enum ChatStartError {
 pub enum DeliveryError {
     #[error("peer is not a local contact")]
     NotAContact,
+    #[error("peer connection is still being checked")]
+    PeerConnectionPending,
+    #[error("peer is not connected")]
+    PeerNotConnected,
     #[error("message body is invalid: {0}")]
     Validation(#[from] ValidationError),
     #[error("delivery timed out after {DELIVERY_TIMEOUT:?}")]
@@ -166,18 +185,23 @@ impl ContactAllowlist {
         self.0.read().await.contains(peer)
     }
 
+    pub(super) async fn snapshot(&self) -> HashSet<EndpointId> {
+        self.0.read().await.clone()
+    }
+
     pub(super) async fn replace_peer_ids(
         &self,
         peers: impl IntoIterator<Item = PeerId>,
-    ) -> Result<HashSet<EndpointId>> {
+    ) -> Result<(HashSet<EndpointId>, HashSet<EndpointId>)> {
         let replacement = peers
             .into_iter()
             .map(|peer_id| peer_id_to_endpoint_id(&peer_id))
             .collect::<Result<HashSet<_>>>()?;
         let mut current = self.0.write().await;
         let removed = current.difference(&replacement).cloned().collect();
+        let added = replacement.difference(&*current).cloned().collect();
         *current = replacement;
-        Ok(removed)
+        Ok((added, removed))
     }
 }
 
