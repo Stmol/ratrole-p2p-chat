@@ -12,6 +12,8 @@ This module adapts the standalone Rathole wire protocol to authenticated Iroh co
 
 `Connected` means that a local Iroh/QUIC connection has completed its handshake. It is not remote presence. The configured `RATHOLE_IROH_PATH_MODE` (`auto` or `relay-only`) controls path selection policy; it is not a report of the path currently selected by Iroh.
 
+A relay-backed connection is immediately usable for message delivery once the handshake completes. Direct IP is an opportunistic optimization that Iroh may select later in `auto` mode. Selected-path diagnostics describe the transport path Iroh currently prefers; they do not gate message admission or delivery readiness.
+
 ## Peer-session lifecycle
 
 On startup and after adding a contact, the transport makes one outbound dial attempt for that contact. The external state is:

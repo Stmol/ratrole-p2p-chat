@@ -5,9 +5,75 @@
 //! [`Connection::paths`] after path events, including `Lagged`, rather than
 //! trusting a single event payload.
 
+use iroh::endpoint::PathEvent;
 use iroh::{TransportAddr, endpoint::Connection};
 
 use crate::domain::connection::{SelectedPath, SelectedPathKind};
+
+/// Runtime-only metadata extracted from one Iroh [`PathEvent`].
+///
+/// Used for JSONL correlation during path transitions. Message bodies and
+/// secrets are never included.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PathEventDetails {
+    pub kind: &'static str,
+    pub path_id: Option<String>,
+    pub path_kind: Option<&'static str>,
+    pub path_remote: Option<String>,
+    pub missed: Option<u64>,
+}
+
+/// Returns a stable label and optional path fields for diagnostic logging.
+///
+/// Event payloads are treated as hints only; callers still re-read
+/// [`Connection::paths`] before publishing selected-path diagnostics.
+pub(super) fn path_event_details(event: &PathEvent) -> PathEventDetails {
+    match event {
+        PathEvent::Opened {
+            id, remote_addr, ..
+        }
+        | PathEvent::Closed {
+            id, remote_addr, ..
+        }
+        | PathEvent::Selected {
+            id, remote_addr, ..
+        } => {
+            let selected = selected_path_from_transport_addr(remote_addr);
+            PathEventDetails {
+                kind: path_event_kind(event),
+                path_id: Some(id.to_string()),
+                path_kind: Some(selected.kind.as_str()),
+                path_remote: selected.remote_address,
+                missed: None,
+            }
+        }
+        PathEvent::Lagged { missed, .. } => PathEventDetails {
+            kind: "lagged",
+            path_id: None,
+            path_kind: None,
+            path_remote: None,
+            missed: Some(*missed),
+        },
+        _ => PathEventDetails {
+            kind: path_event_kind(event),
+            path_id: None,
+            path_kind: None,
+            path_remote: None,
+            missed: None,
+        },
+    }
+}
+
+/// Stable JSONL label for an Iroh path lifecycle event.
+pub(super) fn path_event_kind(event: &PathEvent) -> &'static str {
+    match event {
+        PathEvent::Opened { .. } => "opened",
+        PathEvent::Closed { .. } => "closed",
+        PathEvent::Selected { .. } => "selected",
+        PathEvent::Lagged { .. } => "lagged",
+        _ => "unknown",
+    }
+}
 
 /// Reads the currently selected path from an Iroh connection snapshot.
 ///
