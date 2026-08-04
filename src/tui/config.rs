@@ -36,7 +36,7 @@ pub(crate) struct SidebarConfig {
     pub content_padding_y: u16,
     pub active_glyph: &'static str,
     pub inactive_glyph: &'static str,
-    pub connecting_glyph: &'static str,
+    pub connecting_glyphs: [&'static str; 4],
 }
 
 #[allow(dead_code)]
@@ -56,7 +56,7 @@ impl Default for SidebarConfig {
             content_padding_y: 1,
             active_glyph: "●",
             inactive_glyph: "○",
-            connecting_glyph: "◐",
+            connecting_glyphs: ["◐", "◓", "◑", "◒"],
         }
     }
 }

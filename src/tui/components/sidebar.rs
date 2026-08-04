@@ -92,7 +92,12 @@ fn render_contacts(
         .contacts
         .iter()
         .map(|contact| {
-            let (glyph, color) = connection_marker(contact.connection_state, config, theme);
+            let (glyph, color) = connection_marker(
+                contact.connection_state,
+                props.connecting_frame,
+                config,
+                theme,
+            );
             let label = if contact.unread_count == 0 {
                 short_peer_id(&contact.peer_id)
             } else {
@@ -114,13 +119,17 @@ fn render_contacts(
 
 fn connection_marker(
     state: crate::domain::connection::ContactConnectionState,
+    connecting_frame: usize,
     config: &SidebarConfig,
     theme: &UiTheme,
 ) -> (&'static str, ratatui::style::Color) {
     use crate::domain::connection::ContactConnectionState;
     match state {
         ContactConnectionState::Connected => (config.active_glyph, theme.green),
-        ContactConnectionState::Connecting => (config.connecting_glyph, theme.amber),
+        ContactConnectionState::Connecting => (
+            config.connecting_glyphs[connecting_frame % config.connecting_glyphs.len()],
+            theme.amber,
+        ),
         ContactConnectionState::NotConnected => (config.inactive_glyph, theme.muted),
     }
 }
@@ -242,6 +251,7 @@ mod tests {
                 contacts: &[],
                 relays: &[],
                 selected: 0,
+                connecting_frame: 0,
             },
             &UiConfig::default().sidebar,
             &UiTheme::default(),
@@ -262,6 +272,7 @@ mod tests {
                 contacts: &[],
                 relays: &[],
                 selected: 0,
+                connecting_frame: 0,
             },
             &UiConfig::default().sidebar,
             &UiTheme::default(),
@@ -288,6 +299,7 @@ mod tests {
                 contacts: &[],
                 relays: &[],
                 selected: 0,
+                connecting_frame: 0,
             },
             &UiConfig::default().sidebar,
             &UiTheme::default(),
@@ -312,6 +324,7 @@ mod tests {
                 contacts: &[],
                 relays: &relays,
                 selected: 0,
+                connecting_frame: 0,
             },
             &UiConfig::default().sidebar,
             &UiTheme::default(),
@@ -331,6 +344,7 @@ mod tests {
                 contacts: std::slice::from_ref(&contact),
                 relays: &[],
                 selected: 0,
+                connecting_frame: 0,
             },
             &UiConfig::default().sidebar,
             &UiTheme::default(),
@@ -352,6 +366,7 @@ mod tests {
                 contacts: std::slice::from_ref(&contact),
                 relays: &[],
                 selected: 0,
+                connecting_frame: 0,
             },
             &UiConfig::default().sidebar,
             &UiTheme::default(),
@@ -359,6 +374,35 @@ mod tests {
             16,
         );
         assert!(text.contains("(2)"));
+    }
+
+    #[test]
+    fn connecting_marker_cycles_through_four_positions() {
+        let config = UiConfig::default().sidebar;
+        let theme = UiTheme::default();
+        let frames: Vec<&str> = (0..config.connecting_glyphs.len())
+            .map(|frame| {
+                connection_marker(
+                    crate::domain::connection::ContactConnectionState::Connecting,
+                    frame,
+                    &config,
+                    &theme,
+                )
+                .0
+            })
+            .collect();
+
+        assert_eq!(frames, config.connecting_glyphs);
+        assert_eq!(
+            connection_marker(
+                crate::domain::connection::ContactConnectionState::Connecting,
+                config.connecting_glyphs.len(),
+                &config,
+                &theme,
+            )
+            .0,
+            config.connecting_glyphs[0]
+        );
     }
 
     #[test]
@@ -370,6 +414,7 @@ mod tests {
                 contacts: &[],
                 relays: &[],
                 selected: 0,
+                connecting_frame: 0,
             },
             &UiConfig::default().sidebar,
             &UiTheme::default(),
@@ -391,6 +436,7 @@ mod tests {
                     contacts: &[],
                     relays: &[],
                     selected: 0,
+                    connecting_frame: 0,
                 },
                 &UiConfig::default().sidebar,
                 &UiTheme::default(),

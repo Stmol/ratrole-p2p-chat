@@ -7,11 +7,14 @@ use crate::tui::{
 
 use super::{editor::TextEditor, overlay::Overlay};
 
+pub(crate) const CONNECTING_FRAME_COUNT: usize = 4;
+
 #[derive(Debug)]
 pub(crate) struct SidebarState {
     pub tab: SidebarTab,
     pub contact_index: usize,
     pub relay_index: usize,
+    pub connecting_frame: usize,
 }
 
 impl Default for SidebarState {
@@ -20,6 +23,7 @@ impl Default for SidebarState {
             tab: SidebarTab::Contacts,
             contact_index: 0,
             relay_index: 0,
+            connecting_frame: 0,
         }
     }
 }

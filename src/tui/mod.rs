@@ -86,12 +86,20 @@ fn run_loop(
 
     let blink_interval = Duration::from_millis(500);
     let mut next_blink = Instant::now() + blink_interval;
+    let connecting_frame_interval = Duration::from_millis(125);
+    let mut next_connecting_frame = Instant::now() + connecting_frame_interval;
 
     while !app.should_quit {
         drain_commands(&mut app, &command_rx);
+        let now = Instant::now();
+        if now >= next_connecting_frame {
+            app.advance_connecting_animation();
+            next_connecting_frame = now + connecting_frame_interval;
+        }
         terminal.draw(|frame| ui::render(frame, &app))?;
         let timeout = next_blink
             .saturating_duration_since(Instant::now())
+            .min(next_connecting_frame.saturating_duration_since(Instant::now()))
             .min(Duration::from_millis(50));
         if event::poll(timeout)? {
             match event::read()? {
