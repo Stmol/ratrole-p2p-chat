@@ -227,6 +227,96 @@ async fn connected_session_emits_selected_path_diagnostics_and_preserves_duratio
 }
 
 #[tokio::test]
+async fn connected_session_admits_first_message_without_path_kind_gate() {
+    let (alice, mut bob) = local_pair().await;
+
+    // Connected is sufficient for admission; send_text does not wait for DirectIp.
+    assert_eq!(
+        alice.client.connection_state(&bob.peer_id).await,
+        Some(ContactConnectionState::Connected)
+    );
+    let handle = alice
+        .client
+        .send_text(bob.peer_id.clone(), "first without path gate")
+        .await
+        .expect("connected session should admit send without waiting for DirectIp");
+    let incoming = tokio::time::timeout(Duration::from_secs(5), bob.incoming.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(incoming.message_id, handle.message_id);
+    assert_eq!(handle.wait().await.unwrap().message_id, incoming.message_id);
+
+    alice.transport.shutdown().await.unwrap();
+    bob.transport.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn active_delivery_keeps_single_outcome_through_path_refreshes() {
+    let (mut alice, mut bob) = local_pair().await;
+    let first_since = wait_for_connection_event(
+        &mut alice.connection_events,
+        &bob.peer_id,
+        ContactConnectionState::Connected,
+    )
+    .await
+    .connected_since;
+
+    let recv = tokio::spawn(async move { bob.incoming.recv().await });
+    let handle = alice
+        .client
+        .send_text(bob.peer_id.clone(), "in flight during path refresh")
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(50), alice.connection_events.recv()).await
+        {
+            assert_ne!(event.state, ContactConnectionState::NotConnected);
+            if event.state == ContactConnectionState::Connected {
+                assert_eq!(event.connected_since, first_since);
+            }
+        }
+    }
+
+    let incoming = recv.await.unwrap().unwrap();
+    let receipt = handle.wait().await.unwrap();
+    assert_eq!(receipt.message_id, incoming.message_id);
+    assert_eq!(
+        alice.client.connection_state(&bob.peer_id).await,
+        Some(ContactConnectionState::Connected)
+    );
+
+    alice.transport.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn path_refreshes_preserve_connected_since_across_kind_changes() {
+    let (mut alice, bob) = local_pair().await;
+    let first_since = wait_for_connection_event(
+        &mut alice.connection_events,
+        &bob.peer_id,
+        ContactConnectionState::Connected,
+    )
+    .await
+    .connected_since;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while let Ok(Some(event)) =
+        tokio::time::timeout_at(deadline, alice.connection_events.recv()).await
+    {
+        if event.state == ContactConnectionState::Connected {
+            assert_eq!(event.connected_since, first_since);
+        }
+    }
+
+    alice.transport.shutdown().await.unwrap();
+    bob.transport.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn authorised_contacts_exchange_unicode_text_and_an_ack() {
     let (alice, mut bob) = local_pair().await;
 

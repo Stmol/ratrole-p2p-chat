@@ -54,5 +54,7 @@ jq 'select(.message_id == "<message-id>")' /tmp/rathole-client-a.jsonl
 Focus on connection, receipt, and delivery events:
 
 ```sh
-jq 'select(.event | test("connection|receipt|delivery"))' /tmp/rathole-client-b.jsonl
+jq 'select(.event | test("connection|receipt|delivery|path_event|path_refreshed"))' /tmp/rathole-client-b.jsonl
 ```
+
+Path-transition correlation uses `peer_connection_path_event` (individual Iroh path lifecycle notifications) and `peer_connection_path_refreshed` (selected-path snapshot after re-reading `Connection::paths`). Compare `path_event_kind`, `path_id`, and `path_kind` against `message_delivery_started`, `stream_opened`, `text_frame_written`, and remote `text_frame_received` timestamps. A local `text_frame_written` event is not proof of remote receipt.

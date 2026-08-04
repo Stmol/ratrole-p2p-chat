@@ -602,6 +602,9 @@ impl ChatClient {
                 .ok_or(DeliveryError::PeerNotConnected)?
         };
         match session.connection_state() {
+            // Readiness is the logical Iroh connection handshake, not the
+            // selected path kind. Relay-backed sessions are immediately
+            // eligible; direct IP is an opportunistic transport detail.
             crate::domain::connection::ContactConnectionState::Connecting => {
                 return Err(DeliveryError::PeerConnectionPending);
             }

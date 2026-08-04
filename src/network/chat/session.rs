@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use super::framing::{FrameError, read_single_document, write_document};
-use super::path_diagnostics::selected_path_from_connection;
+use super::path_diagnostics::{path_event_details, selected_path_from_connection};
 use super::transport::TransportInner;
 use super::{
     CompletionSlot, DeliveryCancellation, DeliveryError, DeliveryReceipt, INBOUND_STREAM_TIMEOUT,
@@ -814,13 +814,13 @@ impl SessionActor {
             self.connected_since = Some(StdInstant::now());
         }
         let connected_since = self.connected_since;
-        logging::log_event(
+        self.inner.log_connection_snapshot(
             "session",
             "peer_connection_path_refreshed",
-            LogFields::default()
-                .peer_str(self.peer.to_string())
-                .connection(connection_id)
-                .detail("path_kind", selected_path.kind.as_str()),
+            self.peer,
+            None,
+            &primary.connection,
+            None,
         );
         self.inner.emit_connection_event(PeerConnectionEvent {
             peer_id: PeerId::from_canonical(self.peer.to_string()),
@@ -941,11 +941,32 @@ fn spawn_connection_tasks(
     });
 
     let path_control = control;
+    let path_peer = peer;
     tokio::spawn(async move {
         let mut events = connection.path_events();
-        while let Some(_event) = events.next().await {
-            // Opened, Closed, Selected, and Lagged all trigger a fresh
-            // selected-path snapshot rather than trusting the event payload.
+        while let Some(event) = events.next().await {
+            // Path events are observation-only: log the transition, then ask
+            // the session actor to re-read the selected-path snapshot. This
+            // must not await network work, start a second dial, or touch an
+            // active delivery.
+            let details = path_event_details(&event);
+            let mut fields = LogFields::default()
+                .peer_str(path_peer.to_string())
+                .connection(connection_id)
+                .detail("path_event_kind", details.kind);
+            if let Some(path_id) = details.path_id {
+                fields = fields.detail("path_id", path_id);
+            }
+            if let Some(path_kind) = details.path_kind {
+                fields = fields.detail("path_kind", path_kind);
+            }
+            if let Some(path_remote) = details.path_remote {
+                fields = fields.detail("path_remote", path_remote);
+            }
+            if let Some(missed) = details.missed {
+                fields = fields.detail("path_events_missed", missed.to_string());
+            }
+            logging::log_event("session", "peer_connection_path_event", fields);
             if path_control
                 .send(SessionControl::PathChanged { connection_id })
                 .is_err()
