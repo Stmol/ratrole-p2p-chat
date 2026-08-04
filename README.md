@@ -70,6 +70,43 @@ just run
 # equivalent shortcut: just r
 ```
 
+## OpenSpec workflow
+
+Rathole uses OpenSpec as a repository-local planning layer for changes that need durable requirements, design decisions, and implementation tasks. The generated integrations for Codex, Cursor, and Claude Code are checked in so every supported agent reads the same workflow.
+
+OpenSpec is a development tool, not a Rathole runtime dependency. Install Node.js 20.19.0 or newer, then install the CLI:
+
+```sh
+npm install -g @fission-ai/openspec@latest
+openspec --version
+```
+
+This checkout already contains the generated integrations. Refresh them after upgrading the CLI:
+
+```sh
+openspec update
+```
+
+For a fresh project setup or to regenerate the selected tool tree, use:
+
+```sh
+openspec init --tools codex,cursor,claude --profile core
+```
+
+Use `openspec ...` commands in the terminal. Use the following commands in the AI assistant chat:
+
+| Tool | Propose | Apply | Archive |
+| --- | --- | --- | --- |
+| Codex | `$openspec-propose` | `$openspec-apply-change` | `$openspec-archive-change` |
+| Cursor | `/opsx-propose` | `/opsx-apply` | `/opsx-archive` |
+| Claude Code | `/opsx:propose` | `/opsx:apply` | `/opsx:archive` |
+
+The default loop is: optionally explore an idea, propose a change, review `proposal.md`, `specs/`, `design.md`, and `tasks.md`, apply the approved tasks, sync the delta specs, and archive the completed change. Do not edit generated `openspec-*` skill or `opsx-*` command files by hand; use `openspec update` after changing the CLI or profile.
+
+OpenSpec specs and changes are brownfield documentation. Add a spec for a capability when a real product change needs it; do not generate a speculative inventory of the whole application.
+
+OpenSpec artifacts do not replace `AGENTS.md`, code review, Rust tests, live network acceptance, or the existing security rules. `Delivered` remains a transport/runtime acceptance state and is not a read receipt.
+
 ## Development mode
 
 Use the file-backed development profile when running local tests:

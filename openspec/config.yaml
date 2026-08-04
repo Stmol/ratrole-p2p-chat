@@ -1,0 +1,35 @@
+schema: spec-driven
+
+context: |
+  Project: Rathole, a decentralised communication foundation with a Rust terminal client.
+  Stack: Rust 2024, MSRV 1.91, Iroh transport, Tokio, Ratatui, Crossterm, strict CBOR, TOML/keychain storage.
+  Architecture: Keep CLI parsing, application orchestration, domain types, storage, network transport, and TUI rendering in separate modules.
+  Domain boundary: Domain types must not depend on Ratatui, Crossterm, filesystem access, or Iroh runtime objects.
+  Transport boundary: Keep the strict v1 CBOR protocol in src/protocol/ independent from Iroh, TUI, storage, and contact domain types.
+  Current product semantics: Contacts are local and one-way; chat is online-only and in-memory; Delivered means remote runtime acceptance, not read receipt or durable storage.
+  Security: Device secrets stay in the platform keychain or the explicitly documented development file; public configuration must not contain secrets.
+  Change discipline: Preserve existing protocol limits, authenticated contact allowlists, bounded queues, delivery semantics, TUI ownership rules, and stale-event guards unless a proposal explicitly changes them.
+  Brownfield rule: Inspect the current repository and existing docs before proposing a new capability; do not invent a greenfield architecture or generate specs for unrelated subsystems.
+  Source of project-wide instructions: AGENTS.md and the repository README remain authoritative for Rathole-specific engineering constraints.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
