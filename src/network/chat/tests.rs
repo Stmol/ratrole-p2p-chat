@@ -28,7 +28,7 @@ struct TestPeer {
     transport: ChatTransport,
     client: ChatClient,
     incoming: mpsc::Receiver<IncomingText>,
-    _connection_events: mpsc::UnboundedReceiver<PeerConnectionEvent>,
+    connection_events: mpsc::UnboundedReceiver<PeerConnectionEvent>,
 }
 
 fn handshake_transport_config() -> ChatTransportConfig {
@@ -59,7 +59,7 @@ async fn local_peer_with_config(
         transport,
         client,
         incoming,
-        _connection_events: connection_events,
+        connection_events,
     }
 }
 
@@ -74,6 +74,23 @@ async fn wait_for_peer_state(peer: &TestPeer, remote: &PeerId, expected: Contact
             "timed out waiting for {expected:?} for {remote:?}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_connection_event(
+    events: &mut mpsc::UnboundedReceiver<PeerConnectionEvent>,
+    peer_id: &PeerId,
+    expected: ContactConnectionState,
+) -> PeerConnectionEvent {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("timed out waiting for connection event")
+            .expect("connection event channel closed");
+        if &event.peer_id == peer_id && event.state == expected {
+            return event;
+        }
     }
 }
 
@@ -147,6 +164,66 @@ async fn local_pair() -> (TestPeer, TestPeer) {
     wait_for_peer_state(&alice, &bob_id, ContactConnectionState::Connected).await;
     wait_for_peer_state(&bob, &alice_id, ContactConnectionState::Connected).await;
     (alice, bob)
+}
+
+#[tokio::test]
+async fn connected_session_emits_selected_path_diagnostics_and_preserves_duration() {
+    let (mut alice, bob) = local_pair().await;
+
+    let connected = wait_for_connection_event(
+        &mut alice.connection_events,
+        &bob.peer_id,
+        ContactConnectionState::Connected,
+    )
+    .await;
+    assert!(connected.connected_since.is_some());
+    // Direct loopback routes typically select an IP path; accept relay/custom too
+    // as long as the diagnostic is populated from a live snapshot.
+    assert!(
+        matches!(
+            connected.selected_path.kind,
+            crate::domain::connection::SelectedPathKind::DirectIp
+                | crate::domain::connection::SelectedPathKind::Relay
+                | crate::domain::connection::SelectedPathKind::Custom
+                | crate::domain::connection::SelectedPathKind::Unknown
+        ),
+        "unexpected path kind: {:?}",
+        connected.selected_path.kind
+    );
+    if connected.selected_path.kind != crate::domain::connection::SelectedPathKind::Unknown {
+        let address = connected
+            .selected_path
+            .remote_address
+            .as_deref()
+            .expect("selected path should expose a remote address");
+        assert!(
+            address.starts_with("ip:")
+                || address.starts_with("relay:")
+                || address.starts_with("custom:"),
+            "unexpected address format: {address}"
+        );
+    }
+
+    let first_since = connected.connected_since;
+
+    // Drain any immediate path-refresh events and ensure the logical timestamp is reused.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while let Ok(Some(event)) =
+        tokio::time::timeout_at(deadline, alice.connection_events.recv()).await
+    {
+        if event.state == ContactConnectionState::Connected {
+            assert_eq!(event.connected_since, first_since);
+        }
+    }
+
+    // Query API remains state-only.
+    assert_eq!(
+        alice.client.connection_state(&bob.peer_id).await,
+        Some(ContactConnectionState::Connected)
+    );
+
+    alice.transport.shutdown().await.unwrap();
+    bob.transport.shutdown().await.unwrap();
 }
 
 #[tokio::test]

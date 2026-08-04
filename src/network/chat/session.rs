@@ -4,9 +4,11 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Instant as StdInstant,
 };
 
 use iroh::{EndpointId, endpoint::Connection};
+use n0_future::StreamExt;
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit, mpsc, watch},
     task::JoinHandle,
@@ -14,12 +16,16 @@ use tokio::{
 };
 
 use super::framing::{FrameError, read_single_document, write_document};
+use super::path_diagnostics::selected_path_from_connection;
 use super::transport::TransportInner;
 use super::{
     CompletionSlot, DeliveryCancellation, DeliveryError, DeliveryReceipt, INBOUND_STREAM_TIMEOUT,
     IncomingText, OUTGOING_QUEUE_CAPACITY, PeerConnectionEvent, resolve_once, unix_ms_now,
 };
-use crate::domain::{connection::ContactConnectionState, identity::PeerId};
+use crate::domain::{
+    connection::{ContactConnectionState, SelectedPath},
+    identity::PeerId,
+};
 use crate::logging::{self, LogFields};
 use crate::protocol::{ChatFrame, MessageId, RejectionCode, WireEnvelope};
 
@@ -116,6 +122,9 @@ enum SessionControl {
         message_id: MessageId,
         connection_id: usize,
         result: Result<DeliveryReceipt, DeliveryError>,
+    },
+    PathChanged {
+        connection_id: usize,
     },
     Shutdown(DeliveryError),
     StartOutboundDial,
@@ -218,6 +227,8 @@ struct SessionActor {
     queue: VecDeque<QueuedDelivery>,
     state: SessionState,
     state_tx: watch::Sender<ContactConnectionState>,
+    /// Logical session start for the current externally `Connected` period.
+    connected_since: Option<StdInstant>,
     primary: Option<ConnectionSlot>,
     draining: Vec<ConnectionSlot>,
     active: Option<ActiveDelivery>,
@@ -251,6 +262,7 @@ impl SessionActor {
             queue: VecDeque::new(),
             state: SessionState::Disconnected,
             state_tx,
+            connected_since: None,
             primary: None,
             draining: Vec::new(),
             active: None,
@@ -412,6 +424,9 @@ impl SessionActor {
                 }
                 self.close_draining_finished();
             }
+            SessionControl::PathChanged { connection_id } => {
+                self.refresh_selected_path(connection_id);
+            }
             SessionControl::Shutdown(reason) => {
                 self.stopping = true;
                 self.finish_shutdown(reason).await;
@@ -572,7 +587,13 @@ impl SessionActor {
                     .connection(connection_id)
                     .direction(origin.as_str()),
             );
-            self.log_state(SessionState::Connected);
+            if self.state == SessionState::Connected {
+                // Primary replacement while already connected: refresh path
+                // diagnostics without resetting the logical session timestamp.
+                self.refresh_selected_path(connection_id);
+            } else {
+                self.log_state(SessionState::Connected);
+            }
         } else {
             self.start_draining(slot);
         }
@@ -740,11 +761,72 @@ impl SessionActor {
         }
     }
 
+    /// Publishes an enriched connection update for the current external state.
+    ///
+    /// Records `connected_since` on the first transition to `Connected`, reuses it
+    /// for later Connected publishes (including path refreshes), and clears it on
+    /// `NotConnected` / `Connecting`.
     fn publish_external_state(&mut self, state: ContactConnectionState) {
+        let (selected_path, connected_since) = match state {
+            ContactConnectionState::Connected => {
+                if self.connected_since.is_none() {
+                    self.connected_since = Some(StdInstant::now());
+                }
+                let selected_path = self
+                    .primary
+                    .as_ref()
+                    .map(|slot| selected_path_from_connection(&slot.connection))
+                    .unwrap_or_else(SelectedPath::unknown);
+                (selected_path, self.connected_since)
+            }
+            ContactConnectionState::Connecting | ContactConnectionState::NotConnected => {
+                self.connected_since = None;
+                (SelectedPath::unknown(), None)
+            }
+        };
         let _ = self.state_tx.send(state);
         self.inner.emit_connection_event(PeerConnectionEvent {
             peer_id: PeerId::from_canonical(self.peer.to_string()),
             state,
+            selected_path,
+            connected_since,
+        });
+    }
+
+    /// Re-reads the selected-path snapshot for the primary connection and emits a
+    /// Connected update when the event still belongs to the current primary.
+    ///
+    /// Updates from draining or replaced connections are ignored. The logical
+    /// session timestamp is preserved.
+    fn refresh_selected_path(&mut self, connection_id: usize) {
+        let primary_id = self
+            .primary
+            .as_ref()
+            .map(|slot| slot.connection.stable_id());
+        if !should_apply_path_refresh(primary_id, connection_id, self.state) {
+            return;
+        }
+        let Some(primary) = self.primary.as_ref() else {
+            return;
+        };
+        let selected_path = selected_path_from_connection(&primary.connection);
+        if self.connected_since.is_none() {
+            self.connected_since = Some(StdInstant::now());
+        }
+        let connected_since = self.connected_since;
+        logging::log_event(
+            "session",
+            "peer_connection_path_refreshed",
+            LogFields::default()
+                .peer_str(self.peer.to_string())
+                .connection(connection_id)
+                .detail("path_kind", selected_path.kind.as_str()),
+        );
+        self.inner.emit_connection_event(PeerConnectionEvent {
+            peer_id: PeerId::from_canonical(self.peer.to_string()),
+            state: ContactConnectionState::Connected,
+            selected_path,
+            connected_since,
         });
     }
 }
@@ -754,6 +836,19 @@ fn is_preferred(local: EndpointId, remote: EndpointId, origin: ConnectionOrigin)
         ConnectionOrigin::Outbound => local < remote,
         ConnectionOrigin::Inbound => local > remote,
     }
+}
+
+/// Returns whether a path-refresh event should update diagnostics for the session.
+///
+/// Path updates are accepted only from the current primary connection while the
+/// external session state is `Connected`. Draining or replaced connection IDs are
+/// ignored, including after the primary has already been cleared.
+fn should_apply_path_refresh(
+    primary_connection_id: Option<usize>,
+    event_connection_id: usize,
+    state: SessionState,
+) -> bool {
+    primary_connection_id == Some(event_connection_id) && state == SessionState::Connected
 }
 
 fn spawn_connection_tasks(
@@ -835,13 +930,29 @@ fn spawn_connection_tasks(
         let _ = accept_control.send(SessionControl::AcceptLoopStopped);
     });
 
-    let monitor_control = control;
+    let monitor_control = control.clone();
+    let monitor_connection = connection.clone();
     tokio::spawn(async move {
-        let reason = connection.closed().await;
+        let reason = monitor_connection.closed().await;
         let _ = monitor_control.send(SessionControl::ConnectionClosed {
             connection_id,
             reason: format!("{reason:?}"),
         });
+    });
+
+    let path_control = control;
+    tokio::spawn(async move {
+        let mut events = connection.path_events();
+        while let Some(_event) = events.next().await {
+            // Opened, Closed, Selected, and Lagged all trigger a fresh
+            // selected-path snapshot rather than trusting the event payload.
+            if path_control
+                .send(SessionControl::PathChanged { connection_id })
+                .is_err()
+            {
+                break;
+            }
+        }
     });
 }
 
@@ -1225,5 +1336,50 @@ mod tests {
             ),
             Err(DeliveryError::ProtocolViolation)
         ));
+    }
+
+    #[test]
+    fn path_refresh_accepts_only_primary_connected_connection() {
+        assert!(should_apply_path_refresh(
+            Some(7),
+            7,
+            SessionState::Connected
+        ));
+        assert!(!should_apply_path_refresh(
+            Some(7),
+            8,
+            SessionState::Connected
+        ));
+        assert!(!should_apply_path_refresh(None, 7, SessionState::Connected));
+        assert!(!should_apply_path_refresh(
+            Some(7),
+            7,
+            SessionState::Connecting
+        ));
+        assert!(!should_apply_path_refresh(
+            Some(7),
+            7,
+            SessionState::Disconnected
+        ));
+    }
+
+    #[test]
+    fn logical_connected_since_is_cleared_outside_connected() {
+        let mut connected_since = Some(StdInstant::now());
+        match ContactConnectionState::NotConnected {
+            ContactConnectionState::Connected => {}
+            ContactConnectionState::Connecting | ContactConnectionState::NotConnected => {
+                connected_since = None;
+            }
+        }
+        assert!(connected_since.is_none());
+
+        let first = StdInstant::now();
+        let mut connected_since = Some(first);
+        // Path-only Connected update reuses the existing timestamp.
+        if connected_since.is_none() {
+            connected_since = Some(StdInstant::now());
+        }
+        assert_eq!(connected_since, Some(first));
     }
 }

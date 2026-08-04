@@ -190,6 +190,8 @@ impl<R: ContactRepository> SessionRuntime<R> {
         self.emit(UiCommand::PeerConnectionStateChanged {
             peer_id: event.peer_id,
             state: event.state,
+            selected_path: event.selected_path,
+            connected_since: event.connected_since,
         });
     }
 
@@ -524,9 +526,17 @@ fn log_ui_command(command: &UiCommand) {
             "ui_command_clear_chat",
             LogFields::default().peer(contact_id),
         ),
-        UiCommand::PeerConnectionStateChanged { peer_id, state } => (
+        UiCommand::PeerConnectionStateChanged {
+            peer_id,
+            state,
+            selected_path,
+            ..
+        } => (
             "ui_command_peer_connection_state_changed",
-            LogFields::default().peer(peer_id).status(state.as_str()),
+            LogFields::default()
+                .peer(peer_id)
+                .status(state.as_str())
+                .detail("path_kind", selected_path.kind.as_str()),
         ),
     };
     logging::log_event("session", event, fields);

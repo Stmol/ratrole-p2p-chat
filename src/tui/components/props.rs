@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::tui::{
     action::{ChatMode, Panel, SidebarTab},
     components::overlay::Overlay,
@@ -29,6 +31,8 @@ pub(crate) struct DetailsProps<'a> {
     pub tab: SidebarTab,
     pub contact: Option<&'a ContactView>,
     pub relay: Option<&'a RelayView>,
+    /// Live elapsed logical connection duration derived at the composition boundary.
+    pub connected_for: Option<Duration>,
     pub scroll: u16,
 }
 

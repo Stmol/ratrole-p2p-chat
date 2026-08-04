@@ -165,15 +165,10 @@ impl TransportInner {
         }
         if let Some(path) = connection.paths().iter().find(|path| path.is_selected()) {
             let stats = path.stats();
-            let path_kind = if path.is_relay() {
-                "relay"
-            } else if path.is_ip() {
-                "ip"
-            } else {
-                "custom"
-            };
+            let selected =
+                super::path_diagnostics::selected_path_from_transport_addr(path.remote_addr());
             fields = fields
-                .detail("path_kind", path_kind)
+                .detail("path_kind", selected.kind.as_str())
                 .detail("path_id", path.id().to_string())
                 .detail("rtt_ms", stats.rtt.as_millis().to_string())
                 .detail("udp_tx_bytes", stats.udp_tx.bytes.to_string())
@@ -181,6 +176,9 @@ impl TransportInner {
                 .detail("udp_rx_bytes", stats.udp_rx.bytes.to_string())
                 .detail("udp_rx_datagrams", stats.udp_rx.datagrams.to_string())
                 .detail("lost_packets", stats.lost_packets.to_string());
+            if let Some(remote) = selected.remote_address {
+                fields = fields.detail("path_remote", remote);
+            }
         } else {
             fields = fields.detail("path_kind", "unknown");
         }

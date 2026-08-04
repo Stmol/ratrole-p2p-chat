@@ -1,18 +1,29 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Instant};
 
 use crate::domain::{
-    connection::ContactConnectionState, contact::Contact, identity::PeerId, relay::RelaySource,
+    connection::{ContactConnectionState, SelectedPath},
+    contact::Contact,
+    identity::PeerId,
+    relay::RelaySource,
 };
 use crate::protocol::MessageId;
 
 pub type ContactId = PeerId;
 pub type RelayId = usize;
 
+/// Runtime contact row shown in the sidebar and details panel.
+///
+/// Path, address, and `connected_since` are session diagnostics only. They are
+/// never restored from contact storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContactView {
     pub peer_id: PeerId,
     pub unread_count: usize,
     pub connection_state: ContactConnectionState,
+    /// Observed selected transport path for the current connected session.
+    pub selected_path: SelectedPath,
+    /// Monotonic start of the current logical `Connected` session, when active.
+    pub connected_since: Option<Instant>,
 }
 
 impl ContactView {
@@ -21,6 +32,8 @@ impl ContactView {
             peer_id,
             unread_count: 0,
             connection_state: ContactConnectionState::NotConnected,
+            selected_path: SelectedPath::unknown(),
+            connected_since: None,
         }
     }
 

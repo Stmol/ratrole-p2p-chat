@@ -3823,6 +3823,7 @@ dependencies = [
  "directories",
  "iroh",
  "keyring",
+ "n0-future",
  "predicates",
  "rand 0.10.2",
  "ratatui",
