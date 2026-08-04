@@ -4,7 +4,7 @@
 
 - Keep CLI parsing, application orchestration, domain types, storage, network transport, and TUI rendering in separate modules.
 - Keep domain types independent from Ratatui, Crossterm, filesystem access, and Iroh runtime objects.
-- Treat the user peer ID as a durable root identity and Iroh node identities as per-device transport identities.
+- The current MVP exposes the local Iroh `EndpointId` as the peer ID; when multi-device identity work is implemented, keep a durable user identity separate from per-device Iroh transport identities.
 - Contacts are local and one-way. Presence is shared only with contacts permitted by the owner.
 - The built-in relay set is bootstrap configuration, not a central authority.
 
@@ -24,6 +24,10 @@
 
 - Store future device secrets in the platform keychain and keep only public configuration in the application data directory.
 - Do not claim that a network, relay, identity, or encrypted payload operation happened unless the implementation actually performed it.
+
+## Rust documentation
+
+- When writing or changing Rust code, document the complete implementation in detail: modules, structs, fields, enums, traits, functions, methods, and non-obvious private helpers. Use `//!` and `///` doc comments for module and item contracts, and focused regular comments for internal control flow. Explain purpose, inputs, outputs, ownership and lifecycle, error behavior, invariants, concurrency assumptions, security constraints, and externally visible side effects. Keep the documentation synchronized with behavior whenever the code changes.
 
 ## Engineering workflow
 
