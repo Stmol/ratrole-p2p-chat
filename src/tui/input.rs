@@ -1,3 +1,9 @@
+//! Pure Crossterm key-event mapping for the TUI.
+//!
+//! The mapper reads only a small [`InputContext`] snapshot and returns an
+//! [`Action`]. It never mutates data, opens overlays, sends messages, or checks
+//! transport state; those decisions stay in `TuiApp` and the session bridge.
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::{
@@ -5,6 +11,11 @@ use super::{
     components::props::InputContext,
 };
 
+/// Maps one key press to an application action for the current UI context.
+///
+/// Control-C remains a global quit action. Modal overlays trap navigation, chat
+/// insert mode owns printable characters, and all other keys use the focused
+/// panel's normal command map.
 pub fn action_for_key(context: InputContext, key: KeyEvent) -> Action {
     if key.kind != KeyEventKind::Press {
         return Action::Noop;
@@ -34,6 +45,7 @@ pub fn action_for_key(context: InputContext, key: KeyEvent) -> Action {
     normal_action(context, key)
 }
 
+/// Maps navigation and activation keys while a non-text overlay is open.
 fn overlay_action(key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => Action::Navigate(1),
@@ -46,6 +58,7 @@ fn overlay_action(key: KeyEvent) -> Action {
     }
 }
 
+/// Maps editing keys while the add-contact text overlay owns input.
 fn overlay_text_action(key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Esc => Action::CloseOverlay,
@@ -66,6 +79,7 @@ fn overlay_text_action(key: KeyEvent) -> Action {
     }
 }
 
+/// Maps composer editing keys while chat insert mode is active.
 fn insert_action(key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Esc => Action::ExitInsert,
@@ -87,6 +101,7 @@ fn insert_action(key: KeyEvent) -> Action {
     }
 }
 
+/// Maps non-modal commands according to the focused panel.
 fn normal_action(context: InputContext, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char('q') => return Action::Quit,

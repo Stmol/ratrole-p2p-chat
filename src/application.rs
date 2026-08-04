@@ -1,3 +1,10 @@
+//! Application startup and orchestration for the non-test binary flow.
+//!
+//! This layer owns the order in which identity storage, contact persistence,
+//! logging, chat transport, and the terminal UI are initialized. It passes
+//! values between those layers but keeps their implementation details out of
+//! the domain model.
+
 mod chat_session;
 
 use std::env;
@@ -23,10 +30,18 @@ use chat_session::ChatSession;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BootstrapData {
+    /// Canonical local Iroh peer identity exposed by the current MVP.
     pub peer_id: PeerId,
+    /// Whether this invocation created and persisted a new device identity.
     pub created: bool,
 }
 
+/// Loads an existing device secret or creates and stores a new one.
+///
+/// The returned [`BootstrapData`] is derived from the secret that will be used
+/// by the transport. New secret bytes remain wrapped in `Zeroizing` until they
+/// are handed to the key store; the Iroh key returned to the caller is then
+/// owned by the application session.
 fn bootstrap_identity<K: DeviceKeyStore + ?Sized>(
     keys: &mut K,
 ) -> Result<(BootstrapData, SecretKey)> {
@@ -53,10 +68,21 @@ fn bootstrap_identity<K: DeviceKeyStore + ?Sized>(
     ))
 }
 
+/// Bootstraps only the identity portion of application startup.
+///
+/// This helper is used by tests and callers that need to inspect first-run
+/// behavior without starting logging, storage repositories, or the TUI.
 pub fn bootstrap<K: DeviceKeyStore + ?Sized>(keys: &mut K) -> Result<BootstrapData> {
     Ok(bootstrap_identity(keys)?.0)
 }
 
+/// Runs the selected CLI command and, for the default command, the full TUI
+/// application lifecycle.
+///
+/// Startup loads or creates the device identity, initializes secret-safe
+/// logging, reads contacts, starts the chat session, and then runs the TUI.
+/// Shutdown is attempted after the TUI returns; both TUI and transport results
+/// are preserved so failures are not silently discarded.
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         None => {
@@ -138,6 +164,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// Returns the stable display name used for an unimplemented subcommand.
 fn command_name(command: Command) -> &'static str {
     match command {
         Command::Contacts => "contacts",

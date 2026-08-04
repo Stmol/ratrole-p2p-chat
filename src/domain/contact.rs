@@ -1,3 +1,5 @@
+//! Local contact identity and contact-list value semantics.
+
 use serde::{Deserialize, Serialize};
 
 use super::identity::PeerId;
@@ -5,14 +7,20 @@ use super::identity::PeerId;
 /// A local contact addressed solely by [`PeerId`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Contact {
+    /// Canonical peer identity used for storage and transport authorization.
     peer_id: PeerId,
 }
 
 impl Contact {
+    /// Creates a contact addressed by the supplied canonical peer identity.
+    ///
+    /// The constructor does not perform string parsing. Untrusted text must be
+    /// converted to a [`PeerId`] by the network identity boundary first.
     pub fn new(peer_id: PeerId) -> Self {
         Self { peer_id }
     }
 
+    /// Returns the peer identity used to address this contact.
     pub fn peer_id(&self) -> &PeerId {
         &self.peer_id
     }

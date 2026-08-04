@@ -1,21 +1,37 @@
+//! Terminal-size-aware panel layout calculation.
+//!
+//! Layout selection is pure: it converts an available rectangle, focus, and a
+//! reusable [`LayoutSpec`] into optional panel rectangles. Rendering decides
+//! what to draw in those rectangles but does not recalculate breakpoints.
+
 use ratatui::layout::{Constraint, Layout, Rect};
 
 use super::action::Panel;
 
+/// Geometry and breakpoint values used by layout calculation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LayoutSpec {
+    /// Minimum terminal width before the resize fallback is shown.
     pub min_width: u16,
+    /// Minimum terminal height before the resize fallback is shown.
     pub min_height: u16,
+    /// Width at which all three main panels are visible.
     pub wide_width: u16,
+    /// Width at which two focused panels can be visible.
     pub medium_width: u16,
+    /// Sidebar width in wide/medium modes.
     pub sidebar_width: u16,
+    /// Minimum width reserved for the chat panel.
     pub chat_min_width: u16,
+    /// Details-panel width in wide/medium modes.
     pub details_width: u16,
+    /// Footer height in every usable mode.
     pub footer_height: u16,
 }
 
 #[allow(dead_code)]
 impl LayoutSpec {
+    /// Returns a denser breakpoint preset for compact previews.
     pub(crate) fn compact() -> Self {
         Self {
             min_width: 32,
@@ -45,28 +61,41 @@ impl Default for LayoutSpec {
     }
 }
 
+/// Rendering mode selected from terminal size and focus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutMode {
+    /// The terminal is too small to render normal panels.
     TooSmall,
+    /// Only the focused panel occupies the body.
     Narrow,
+    /// Sidebar plus one detail/chat panel are visible.
     Medium,
+    /// Sidebar, chat, and details are visible together.
     Wide,
 }
 
+/// Optional rectangles assigned to the TUI's main regions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AppLayout {
+    /// Breakpoint mode that produced these rectangles.
     pub mode: LayoutMode,
+    /// Sidebar rectangle, if visible.
     pub list: Option<Rect>,
+    /// Chat rectangle, if visible.
     pub chat: Option<Rect>,
+    /// Details rectangle, if visible.
     pub details: Option<Rect>,
+    /// Footer rectangle, if the terminal is usable.
     pub footer: Option<Rect>,
 }
 
 #[allow(dead_code)]
+/// Calculates layout using the default production preset.
 pub fn calculate_layout(area: Rect, focus: Panel) -> AppLayout {
     calculate_layout_with_spec(area, focus, &LayoutSpec::default())
 }
 
+/// Calculates layout using an explicit preset without mutating application state.
 pub(crate) fn calculate_layout_with_spec(area: Rect, focus: Panel, spec: &LayoutSpec) -> AppLayout {
     if area.width < spec.min_width || area.height < spec.min_height {
         return AppLayout {

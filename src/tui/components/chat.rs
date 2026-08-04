@@ -1,3 +1,9 @@
+//! Chat transcript and message-composer renderer.
+//!
+//! The component renders only the supplied in-memory transcript and draft. It
+//! keeps message-card geometry, sender rails, cursor visibility, and delivery
+//! labels local to presentation; it does not send messages or mutate `TuiData`.
+
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -23,8 +29,11 @@ const RAIL_WIDTH: u16 = 1;
 const CARD_PAD_X: u16 = 2;
 /// Inner vertical padding inside each card.
 const CARD_PAD_Y: u16 = 1;
-/// Blank rows between consecutive message cards.
-/// Composer block height (top pad + draft + bottom pad).
+/// Render the selected contact's transcript and composer.
+///
+/// An absent contact shows an empty-state prompt. A present contact gets a
+/// bottom-anchored transcript, a one-row spacer, and a fixed-height composer
+/// whose cursor is controlled by the borrowed props.
 pub fn render_chat(
     frame: &mut Frame,
     area: Rect,
@@ -71,6 +80,7 @@ pub fn render_chat(
     render_composer(frame, composer, &props, config, theme);
 }
 
+/// Builds the title line from the selected contact's compact peer ID.
 fn chat_title(props: &ChatProps<'_>) -> Line<'static> {
     match props.contact {
         Some(contact) => Line::from(format!(" {} ", short_peer_id(&contact.peer_id))),
@@ -78,6 +88,7 @@ fn chat_title(props: &ChatProps<'_>) -> Line<'static> {
     }
 }
 
+/// Renders the newest messages that fit in the transcript rectangle.
 fn render_transcript(
     frame: &mut Frame,
     area: Rect,
@@ -166,6 +177,7 @@ fn render_transcript(
     }
 }
 
+/// Renders the draft surface and focus-dependent cursor rail.
 fn render_composer(
     frame: &mut Frame,
     area: Rect,
@@ -203,6 +215,7 @@ fn render_composer(
     );
 }
 
+/// Builds the composer line for normal or insert mode without mutating the draft.
 fn composer_body(
     props: &ChatProps<'_>,
     draft: &str,
@@ -248,6 +261,7 @@ fn composer_body(
     ])
 }
 
+/// Builds one message card with sender, timestamp, and delivery metadata.
 fn message_card<'a>(
     message: &'a MessageView,
     author: &str,
@@ -266,6 +280,7 @@ fn message_card<'a>(
     .block(block)
 }
 
+/// Builds the metadata line while omitting delivery labels for incoming messages.
 fn message_meta_spans(
     message: &MessageView,
     author: &str,
@@ -288,6 +303,7 @@ fn message_meta_spans(
     spans
 }
 
+/// Returns the display label for an outgoing delivery state.
 fn delivery_label(message: &MessageView) -> Option<&'static str> {
     match message.delivery {
         Some(DeliveryState::Pending) => Some("Pending"),
@@ -299,6 +315,7 @@ fn delivery_label(message: &MessageView) -> Option<&'static str> {
     }
 }
 
+/// Paints the sender/focus rail alongside a card.
 fn render_rail(frame: &mut Frame, area: Rect, color: ratatui::style::Color) {
     let rail = format!("{}\n", RAIL_GLYPH).repeat(area.height as usize);
     frame.render_widget(Paragraph::new(rail).style(Style::new().fg(color)), area);
@@ -364,6 +381,7 @@ fn crop_draft_left(draft: &str, width: usize) -> String {
     chars[chars.len() - width..].iter().collect()
 }
 
+/// Estimates a wrapped card height for bottom-anchored transcript selection.
 fn message_height(message: &MessageView, author: &str, width: u16) -> u16 {
     let width = content_width(width);
     let header = match delivery_label(message) {
@@ -374,6 +392,7 @@ fn message_height(message: &MessageView, author: &str, width: u16) -> u16 {
     (lines.max(1) as u16).saturating_add(CARD_PAD_Y.saturating_mul(2))
 }
 
+/// Counts wrapped display rows without splitting Unicode scalar values.
 fn wrapped_line_count(text: &str, width: usize) -> usize {
     if width == 0 {
         return 0;

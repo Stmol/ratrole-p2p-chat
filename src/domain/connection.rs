@@ -13,8 +13,11 @@ use std::time::Duration;
 /// presence and not durable contact metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContactConnectionState {
+    /// The local session actor is performing its initial connection check.
     Connecting,
+    /// The local session has a primary authenticated connection.
     Connected,
+    /// No primary connection is currently available.
     NotConnected,
 }
 

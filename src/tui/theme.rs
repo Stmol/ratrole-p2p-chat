@@ -1,19 +1,31 @@
+//! Shared TUI colors and panel styling helpers.
+
 use ratatui::{
     style::{Color, Style},
     text::Line,
     widgets::{Block, Borders},
 };
 
+/// Palette used by every renderer in a TUI frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UiTheme {
+    /// Background of the whole terminal canvas.
     pub canvas: Color,
+    /// Background of panels and modal surfaces.
     pub panel: Color,
+    /// Background of message/composer cards.
     pub message: Color,
+    /// Primary readable text color.
     pub text: Color,
+    /// Secondary labels and disabled controls.
     pub muted: Color,
+    /// Focus and local-message accent.
     pub blue: Color,
+    /// Connected/enabled accent.
     pub green: Color,
+    /// Connecting/status accent.
     pub amber: Color,
+    /// Destructive-action accent.
     pub danger: Color,
 }
 
@@ -33,6 +45,7 @@ impl Default for UiTheme {
     }
 }
 
+/// Creates a themed panel block with focus-aware border color.
 pub(crate) fn panel_block_with_theme<'a>(
     theme: &UiTheme,
     title: impl Into<Line<'a>>,

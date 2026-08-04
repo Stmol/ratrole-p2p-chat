@@ -1,3 +1,10 @@
+//! Central TUI state machine and the typed command/effect boundary.
+//!
+//! [`TuiApp`] owns shared `TuiData`, focus, overlay state, drafts, scroll
+//! offsets, and the selected UI configuration. It is the only component allowed
+//! to apply [`UiCommand`] values that mutate shared data; renderers only receive
+//! immutable props and return to this orchestrator through actions/effects.
+
 use std::time::Instant;
 
 use crate::domain::{
@@ -25,67 +32,119 @@ use super::{
     },
 };
 
+/// Request from the TUI for work owned by the application/session layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UiEffect {
+    /// Persist a newly validated contact and update the live allowlist.
     PersistContact(PeerId),
+    /// Remove a contact from persistence and the live allowlist.
     RemoveContact(PeerId),
+    /// Copy text through the application clipboard boundary.
     CopyText(String),
-    SendText { peer_id: PeerId, body: String },
+    /// Request transport delivery of one message body.
+    SendText {
+        /// Target contact identity.
+        peer_id: PeerId,
+        /// Body to validate and queue through the session layer.
+        body: String,
+    },
 }
 
+/// Update from the application/session layer that the TUI applies centrally.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UiCommand {
+    /// Add a contact row after persistence succeeds.
     ContactAdded(ContactView),
+    /// Select an existing contact and show a duplicate status.
     ContactAlreadyExists(PeerId),
+    /// Remove a contact and its in-memory UI state.
     ContactRemoved(PeerId),
+    /// Toggle one relay's local enabled flag.
     ToggleRelay(usize),
+    /// Remove a user-provided relay row.
     RemoveRelay(usize),
+    /// Clear one in-memory transcript unless its connection check is pending.
     ClearChat(ContactId),
+    /// Display a transient status message in the footer.
     ShowStatus(String),
+    /// Append a locally queued outgoing message as `Pending`.
     OutgoingQueued {
+        /// Target contact identity.
         peer_id: PeerId,
+        /// Protocol message identifier.
         message_id: MessageId,
+        /// Sender timestamp in Unix milliseconds.
         sent_at_unix_ms: i64,
+        /// Message body held in the in-memory transcript.
         body: String,
     },
+    /// Replace an outgoing message's pending state with a terminal state.
     OutgoingSettled {
+        /// Target contact identity.
         peer_id: PeerId,
+        /// Protocol message identifier to settle.
         message_id: MessageId,
+        /// Remote acceptance, rejection, timeout, or local failure.
         delivery: DeliveryState,
     },
+    /// Reject a send before a message row was created.
     SendRejected {
+        /// Target contact identity whose pending-send guard is cleared.
         peer_id: PeerId,
+        /// User-facing rejection text.
         message: String,
     },
+    /// Append one accepted incoming message to a contact transcript.
     IncomingMessage {
+        /// Sender contact identity.
         peer_id: PeerId,
+        /// Protocol message identifier.
         message_id: MessageId,
+        /// Sender timestamp in Unix milliseconds.
         sent_at_unix_ms: i64,
+        /// Incoming body stored only in the current TUI process.
         body: String,
     },
+    /// Update one contact's local session/path diagnostics.
     PeerConnectionStateChanged {
+        /// Contact whose session changed.
         peer_id: PeerId,
+        /// New local connection state.
         state: ContactConnectionState,
+        /// Observed selected path for a connected session.
         selected_path: SelectedPath,
+        /// Monotonic start of the logical connected period, if supplied.
         connected_since: Option<Instant>,
     },
 }
 
+/// Mutable TUI application state and component composition boundary.
 #[derive(Debug)]
 pub struct TuiApp {
+    /// Set by `Quit` and read by the outer event loop.
     pub should_quit: bool,
+    /// Current panel focus.
     pub focus: Panel,
+    /// Shared application-facing rows and transcripts.
     pub data: TuiData,
+    /// Immutable presentation preset used by renderers.
     config: UiConfig,
+    /// Transient footer status text.
     status: Option<String>,
+    /// One effect waiting to be dispatched by the outer TUI loop.
     pending_effect: Option<UiEffect>,
+    /// Sidebar-local selection and animation state.
     sidebar: SidebarState,
+    /// Chat-local drafts, scroll positions, and send guards.
     chat: ChatState,
+    /// Details-local scroll state.
     details: DetailsState,
+    /// Modal/menu state.
     overlay: OverlayState,
 }
 
 impl TuiApp {
+    /// Creates an application state machine with default local component state.
     pub(crate) fn new(data: TuiData, config: UiConfig) -> Self {
         Self {
             should_quit: false,
@@ -102,6 +161,7 @@ impl TuiApp {
     }
 
     #[cfg(test)]
+    /// Creates deterministic empty data for renderer/state tests.
     pub(crate) fn demo() -> Self {
         use crate::network::identity::peer_id_from_secret;
 
@@ -116,15 +176,18 @@ impl TuiApp {
         )
     }
 
+    /// Borrows the immutable presentation configuration.
     pub(crate) fn config(&self) -> &UiConfig {
         &self.config
     }
 
     #[cfg(test)]
+    /// Returns the current transient status for state tests.
     pub(crate) fn status(&self) -> Option<&str> {
         self.status.as_deref()
     }
 
+    /// Takes the pending side effect so the outer loop can dispatch it once.
     pub(crate) fn take_effect(&mut self) -> Option<UiEffect> {
         self.pending_effect.take()
     }
@@ -139,6 +202,7 @@ impl TuiApp {
         }
     }
 
+    /// Opens a fresh add-contact editor overlay.
     pub(crate) fn open_add_contact(&mut self) {
         self.overlay.overlay = Some(Overlay::AddContact {
             editor: TextEditor::default(),
@@ -146,6 +210,7 @@ impl TuiApp {
         });
     }
 
+    /// Opens the first-run identity overlay with the complete local peer ID.
     pub(crate) fn show_first_run_identity(&mut self) {
         self.overlay.overlay = Some(Overlay::FirstRunIdentity {
             peer_id: self.data.own_peer_id.clone(),
@@ -157,6 +222,7 @@ impl TuiApp {
         matches!(self.overlay.overlay, Some(Overlay::FirstRunIdentity { .. }))
     }
 
+    /// Builds the immutable context consumed by key mapping.
     pub(crate) fn input_context(&self) -> InputContext {
         InputContext {
             focus: self.focus,
@@ -166,6 +232,7 @@ impl TuiApp {
         }
     }
 
+    /// Builds borrowed sidebar props at the frame composition boundary.
     pub(crate) fn sidebar_props(&self) -> SidebarProps<'_> {
         let selected = match self.sidebar.tab {
             SidebarTab::Contacts => self.clamped_contact_index(),
@@ -181,6 +248,7 @@ impl TuiApp {
         }
     }
 
+    /// Builds borrowed chat props, clamping draft cursor and scroll state.
     pub(crate) fn chat_props(&self) -> ChatProps<'_> {
         let contact = self.active_contact();
         let id = contact.map(|contact| contact.id());
@@ -211,6 +279,7 @@ impl TuiApp {
         }
     }
 
+    /// Builds borrowed details props and derives live connected duration.
     pub(crate) fn details_props(&self) -> DetailsProps<'_> {
         let scroll = match self.sidebar.tab {
             SidebarTab::Contacts => self.details.contacts_scroll,
@@ -232,6 +301,7 @@ impl TuiApp {
         }
     }
 
+    /// Builds borrowed footer props with status precedence.
     pub(crate) fn footer_props(&self) -> FooterProps<'_> {
         FooterProps {
             focus: self.focus,
@@ -240,6 +310,7 @@ impl TuiApp {
         }
     }
 
+    /// Builds borrowed overlay props without exposing the full app to renderers.
     pub(crate) fn overlay_props(&self) -> OverlayProps<'_> {
         OverlayProps {
             focus: self.focus,
@@ -248,10 +319,16 @@ impl TuiApp {
         }
     }
 
+    /// Returns whether an overlay currently traps normal panel input.
     pub(crate) fn overlay_open(&self) -> bool {
         self.overlay.overlay.is_some()
     }
 
+    /// Applies one pure input action to local TUI state.
+    ///
+    /// The method clears stale status text, gives overlays first refusal, and
+    /// creates effects rather than performing persistence, clipboard, or network
+    /// work directly.
     pub fn update(&mut self, action: Action) {
         if !matches!(action, Action::Noop | Action::SubmitDraft) {
             self.status = None;
@@ -313,6 +390,7 @@ impl TuiApp {
         }
     }
 
+    /// Toggles the insert-mode cursor when the outer loop's blink timer fires.
     pub fn toggle_cursor_blink(&mut self) {
         self.chat.cursor_visible =
             if self.focus == Panel::Chat && self.chat.mode == ChatMode::Insert {
@@ -322,6 +400,7 @@ impl TuiApp {
             };
     }
 
+    /// Advances the connecting marker only while at least one contact is pending.
     pub(crate) fn advance_connecting_animation(&mut self) {
         if self
             .data
@@ -334,6 +413,7 @@ impl TuiApp {
         }
     }
 
+    /// Changes focus and leaves chat insert mode when chat loses focus.
     fn set_focus(&mut self, focus: Panel) {
         self.focus = focus;
         if focus != Panel::Chat {
@@ -341,30 +421,36 @@ impl TuiApp {
         }
     }
 
+    /// Returns the currently selected contact using a clamped sidebar index.
     fn active_contact(&self) -> Option<&ContactView> {
         props::selected_contact(&self.data, self.sidebar.contact_index)
     }
 
+    /// Returns the currently selected relay using a clamped sidebar index.
     fn active_relay(&self) -> Option<&super::model::RelayView> {
         props::selected_relay(&self.data, self.sidebar.relay_index)
     }
 
+    /// Clamps the contact index to the current list, including an empty list.
     fn clamped_contact_index(&self) -> usize {
         self.sidebar
             .contact_index
             .min(self.data.contacts.len().saturating_sub(1))
     }
 
+    /// Clamps the relay index to the current list, including an empty list.
     fn clamped_relay_index(&self) -> usize {
         self.sidebar
             .relay_index
             .min(self.data.relays.len().saturating_sub(1))
     }
 
+    /// Returns the selected contact ID used for drafts/transcripts.
     fn active_id(&self) -> Option<ContactId> {
         self.active_contact().map(|contact| contact.id())
     }
 
+    /// Resets the scroll offset for the newly selected sidebar tab.
     fn details_reset(&mut self) {
         match self.sidebar.tab {
             SidebarTab::Contacts => self.details.contacts_scroll = 0,
@@ -372,17 +458,20 @@ impl TuiApp {
         }
     }
 
+    /// Returns or creates the draft editor for the selected contact.
     fn active_editor_mut(&mut self) -> Option<&mut TextEditor> {
         let id = self.active_id()?;
         Some(self.chat.drafts.entry(id).or_default())
     }
 
+    /// Applies one editor mutation to the selected contact's draft.
     fn edit_active_chat(&mut self, mutate: impl FnOnce(&mut TextEditor)) {
         if let Some(editor) = self.active_editor_mut() {
             mutate(editor);
         }
     }
 
+    /// Moves list selection, transcript scroll, or details scroll by a delta.
     fn navigate(&mut self, delta: i16) {
         match self.focus {
             Panel::List => match self.sidebar.tab {
@@ -417,12 +506,14 @@ impl TuiApp {
         }
     }
 
+    /// Converts a page action into a larger navigation delta outside the list.
     fn page(&mut self, delta: i16) {
         if self.focus != Panel::List {
             self.navigate(delta.saturating_mul(5));
         }
     }
 
+    /// Builds the context menu for the current focus and selected data.
     fn open_context_menu(&mut self) {
         let actions = match self.focus {
             Panel::List | Panel::Details => match self.sidebar.tab {
@@ -477,6 +568,11 @@ impl TuiApp {
         }
     }
 
+    /// Re-checks whether a menu action is safe for the current live state.
+    ///
+    /// This validation happens at activation time as well as while rendering,
+    /// preventing stale enabled flags from removing a contact during a pending
+    /// connection check or removing a built-in relay.
     fn menu_action_enabled(&self, action: &MenuAction) -> bool {
         match action {
             MenuAction::CopyOwnId | MenuAction::AddContact | MenuAction::ToggleRelay(_) => true,
@@ -497,6 +593,7 @@ impl TuiApp {
         }
     }
 
+    /// Applies an action within the active modal/menu state machine.
     fn update_overlay(&mut self, action: Action) {
         if matches!(self.overlay.overlay, Some(Overlay::FirstRunIdentity { .. })) {
             if action == Action::Activate
@@ -570,6 +667,7 @@ impl TuiApp {
         }
     }
 
+    /// Applies editor/activation actions to the add-contact overlay.
     fn update_add_contact(&mut self, action: Action) {
         match action {
             Action::CloseOverlay => self.overlay.overlay = None,
@@ -585,6 +683,7 @@ impl TuiApp {
         }
     }
 
+    /// Mutates the add-contact editor and clears its previous validation error.
     fn edit_add_contact(&mut self, mutate: impl FnOnce(&mut TextEditor)) {
         if let Some(Overlay::AddContact { editor, error }) = self.overlay.overlay.as_mut() {
             mutate(editor);
@@ -592,6 +691,10 @@ impl TuiApp {
         }
     }
 
+    /// Validates the add-contact draft and emits a persistence effect when new.
+    ///
+    /// Self IDs and duplicates are handled locally; malformed IDs keep the
+    /// overlay open so the user can correct the draft.
     fn submit_add_contact(&mut self) {
         let Some(Overlay::AddContact { editor, .. }) = self.overlay.overlay.clone() else {
             return;
@@ -630,6 +733,7 @@ impl TuiApp {
         self.overlay.overlay = None;
     }
 
+    /// Converts a confirmed menu action into a local mutation or UI effect.
     fn apply_menu_action(&mut self, action: MenuAction) {
         match action {
             MenuAction::RemoveContact(id) => {
@@ -642,6 +746,11 @@ impl TuiApp {
         }
     }
 
+    /// Applies one application/session update to shared TUI state.
+    ///
+    /// This is the sole mutation boundary for `TuiData`. Connection updates are
+    /// guarded by contact identity, outgoing settlements match message IDs, and
+    /// removed contacts clear all associated local presentation state.
     pub(crate) fn apply_command(&mut self, command: UiCommand) {
         log_ui_command_applied(&command);
         match command {
@@ -742,6 +851,7 @@ impl TuiApp {
         }
     }
 
+    /// Selects a contact and resets the contacts details scroll.
     fn select_contact(&mut self, peer_id: &PeerId) {
         if let Some(index) = self
             .data
@@ -755,6 +865,7 @@ impl TuiApp {
         self.details.contacts_scroll = 0;
     }
 
+    /// Removes a contact and every transcript/draft/scroll entry keyed by it.
     fn remove_contact_state(&mut self, peer_id: &PeerId) {
         self.data
             .contacts
@@ -767,6 +878,7 @@ impl TuiApp {
         self.details.contacts_scroll = 0;
     }
 
+    /// Appends a queued local message with a `Pending` delivery state.
     fn append_outgoing_message(
         &mut self,
         peer_id: PeerId,
@@ -793,6 +905,7 @@ impl TuiApp {
             });
     }
 
+    /// Settles only the matching local message row by message ID.
     fn settle_outgoing_message(
         &mut self,
         peer_id: PeerId,
@@ -810,6 +923,7 @@ impl TuiApp {
         }
     }
 
+    /// Appends an incoming message and increments unread state when unfocused.
     fn append_incoming_message(
         &mut self,
         peer_id: PeerId,
@@ -844,6 +958,10 @@ impl TuiApp {
         }
     }
 
+    /// Validates the selected contact state and emits one send effect.
+    ///
+    /// The per-contact pending set prevents duplicate effects until the session
+    /// returns either a queued/settled update or a rejection.
     fn submit_draft(&mut self) {
         let Some(peer_id) = self.active_id() else {
             return;
@@ -884,6 +1002,7 @@ impl TuiApp {
         self.pending_effect = Some(UiEffect::SendText { peer_id, body });
     }
 
+    /// Clears unread state for the currently selected contact row.
     fn clear_unread_for_selected_contact(&mut self) {
         let index = self.clamped_contact_index();
         if let Some(contact) = self.data.contacts.get_mut(index) {
@@ -891,6 +1010,7 @@ impl TuiApp {
         }
     }
 
+    /// Returns whether a peer is still represented in the local TUI contact list.
     fn has_contact(&self, peer_id: &PeerId) -> bool {
         self.data
             .contacts
@@ -899,6 +1019,7 @@ impl TuiApp {
     }
 }
 
+/// Logs an applied command using correlation-safe metadata only.
 fn log_ui_command_applied(command: &UiCommand) {
     let (event, fields) = match command {
         UiCommand::ContactAdded(contact) => (
@@ -988,6 +1109,7 @@ fn log_ui_command_applied(command: &UiCommand) {
     logging::log_event("tui", event, fields);
 }
 
+/// Converts a delivery state to its stable diagnostic label.
 fn delivery_state_name(delivery: DeliveryState) -> &'static str {
     match delivery {
         DeliveryState::Pending => "pending",
@@ -998,6 +1120,7 @@ fn delivery_state_name(delivery: DeliveryState) -> &'static str {
     }
 }
 
+/// Moves an index within a bounded list without underflow or overflow.
 fn move_index(current: usize, delta: i16, len: usize) -> usize {
     if len == 0 {
         return 0;

@@ -16,10 +16,15 @@ use crate::domain::connection::{SelectedPath, SelectedPathKind};
 /// secrets are never included.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PathEventDetails {
+    /// Stable event-kind label used in JSONL records.
     pub kind: &'static str,
+    /// Iroh path ID when the event carries one.
     pub path_id: Option<String>,
+    /// App-neutral selected-path classification when available.
     pub path_kind: Option<&'static str>,
+    /// Display form of the remote transport address when available.
     pub path_remote: Option<String>,
+    /// Number of missed events for a lagged subscription.
     pub missed: Option<u64>,
 }
 

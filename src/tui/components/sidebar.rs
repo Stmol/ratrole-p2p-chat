@@ -1,3 +1,9 @@
+//! Contact and relay list renderer.
+//!
+//! The sidebar displays local contact/session state and relay configuration
+//! rows. Selection and animation indexes come from borrowed props; this module
+//! does not mutate application state or probe network reachability.
+
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -17,6 +23,7 @@ use crate::tui::{
     theme::{UiTheme, panel_block_with_theme},
 };
 
+/// Renders sidebar tabs and the selected contacts/relays list.
 pub fn render_sidebar(
     frame: &mut Frame,
     area: Rect,
@@ -71,6 +78,7 @@ fn tab_label_style(selected: bool, theme: &UiTheme) -> Style {
     }
 }
 
+/// Renders contact rows and their connection/unread markers.
 fn render_contacts(
     frame: &mut Frame,
     area: Rect,
@@ -134,6 +142,7 @@ fn connection_marker(
     }
 }
 
+/// Renders relay rows with source and local enabled-state labels.
 fn render_relays(
     frame: &mut Frame,
     area: Rect,
@@ -218,6 +227,7 @@ fn padded_vertical(area: Rect, padding: u16) -> Option<Rect> {
     ))
 }
 
+/// Removes the scheme and trailing dot for compact relay-row display.
 pub(crate) fn compact_relay_host(url: &str) -> String {
     let without_scheme = url
         .strip_prefix("https://")

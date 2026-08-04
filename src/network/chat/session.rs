@@ -1,3 +1,10 @@
+//! Per-contact session actors and one-stream delivery workers.
+//!
+//! A [`PeerSession`] owns one actor for one authenticated contact. The actor
+//! serializes connection selection, queues, lifecycle transitions, and
+//! completion settlement; short-lived stream tasks perform the actual
+//! request/response I/O and report back through `SessionControl`.
+
 use std::{
     collections::VecDeque,
     sync::{
@@ -29,34 +36,53 @@ use crate::domain::{
 use crate::logging::{self, LogFields};
 use crate::protocol::{ChatFrame, MessageId, RejectionCode, WireEnvelope};
 
+/// One outgoing message waiting for or undergoing delivery.
 #[derive(Clone)]
 pub(super) struct QueuedDelivery {
+    /// Validated protocol envelope to write on the wire.
     pub(super) envelope: WireEnvelope,
+    /// Correlation ID echoed by the remote receipt.
     pub(super) message_id: MessageId,
+    /// Shared completion slot resolved by the worker or deadline task.
     pub(super) completion: CompletionSlot,
+    /// Cancellation token shared with the deadline watcher.
     pub(super) cancellation: Arc<DeliveryCancellation>,
+    /// Monotonic terminal deadline for queueing and stream I/O.
     pub(super) deadline: Instant,
+    /// Time at which the message entered the per-peer queue.
     pub(super) queued_at: Instant,
 }
 
+/// Cloneable handle to one per-contact session actor.
 #[derive(Clone)]
 pub(super) struct PeerSession {
+    /// Bounded queue of outgoing deliveries.
     tx: mpsc::Sender<QueuedDelivery>,
+    /// Control channel for connections, path events, and shutdown.
     control: mpsc::UnboundedSender<SessionControl>,
+    /// Join handle storage used to await actor shutdown exactly once.
     join: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Number of messages reserved in the queue or currently being processed.
     queued: Arc<AtomicUsize>,
+    /// Watch receiver exposing the actor's external connection state.
     state: watch::Receiver<ContactConnectionState>,
 }
 
+/// Internal session state, including lifecycle states hidden from the TUI.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum SessionState {
+    /// No primary connection is available.
     Disconnected,
+    /// A single outbound connection attempt is in progress.
     Connecting,
+    /// A primary connection can carry messages and accept streams.
     Connected,
+    /// The actor is draining work and closing connections.
     Closing,
 }
 
 impl SessionState {
+    /// Maps an internal state to the external contact state, omitting shutdown.
     fn as_external(self) -> Option<ContactConnectionState> {
         match self {
             Self::Connecting => Some(ContactConnectionState::Connecting),
@@ -67,13 +93,17 @@ impl SessionState {
     }
 }
 
+/// Origin used when deterministic connection preference is calculated.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ConnectionOrigin {
+    /// The remote endpoint initiated the Iroh connection.
     Inbound,
+    /// This endpoint initiated the Iroh connection.
     Outbound,
 }
 
 impl ConnectionOrigin {
+    /// Returns the stable diagnostic label for the origin.
     fn as_str(self) -> &'static str {
         match self {
             Self::Inbound => "inbound",
@@ -82,55 +112,95 @@ impl ConnectionOrigin {
     }
 }
 
+/// One active or draining Iroh connection attached to a peer session.
 struct ConnectionSlot {
+    /// Iroh connection handle shared with stream tasks.
     connection: Connection,
+    /// Whether the connection was inbound or outbound.
     origin: ConnectionOrigin,
+    /// Signal stopping new inbound stream acceptance during draining.
     stop_accept: watch::Sender<bool>,
+    /// Number of inbound stream handlers still using the connection.
     active_handlers: usize,
+    /// Number of outbound stream workers still using the connection.
     active_outbound: usize,
 }
 
+/// The one outbound command currently executing on the primary connection.
 struct ActiveDelivery {
+    /// Original queue command and its completion state.
     command: QueuedDelivery,
+    /// Connection used by the stream, if a connection has been selected.
     connection_id: Option<usize>,
+    /// Worker task performing the stream exchange.
     task: Option<JoinHandle<()>>,
 }
 
+/// Messages serialized by the session actor's control loop.
 enum SessionControl {
+    /// Attach an accepted connection to the actor.
     Attach {
+        /// Iroh connection being attached.
         connection: Connection,
+        /// Whether the connection was inbound or outbound.
         origin: ConnectionOrigin,
     },
+    /// Report the result of an asynchronous outbound dial.
     DialFinished {
+        /// Dial result to attach or turn into a local failure.
         result: Result<Connection, String>,
     },
+    /// Report closure of an attached connection.
     ConnectionClosed {
+        /// Stable ID of the closed connection.
         connection_id: usize,
+        /// Iroh close reason rendered for logging.
         reason: String,
     },
+    /// Tell the actor that an attached connection stopped accepting streams.
     AcceptLoopStopped,
+    /// Deliver one accepted bidi stream to an attached connection slot.
     InboundStream {
+        /// Stable ID of the connection that accepted the stream.
         connection_id: usize,
+        /// Send half of the bidi stream.
         send: iroh::endpoint::SendStream,
+        /// Receive half of the bidi stream.
         recv: iroh::endpoint::RecvStream,
+        /// Concurrency permit held until the stream handler exits.
         permit: OwnedSemaphorePermit,
     },
+    /// Release the active-handler count for an inbound stream.
     InboundFinished {
+        /// Stable ID of the connection whose handler finished.
         connection_id: usize,
     },
+    /// Settle the active outbound delivery and release its connection count.
     OutboundFinished {
+        /// Message identifier of the completed delivery.
         message_id: MessageId,
+        /// Stable ID of the connection used by the worker.
         connection_id: usize,
+        /// Validated receipt or terminal error.
         result: Result<DeliveryReceipt, DeliveryError>,
     },
+    /// Re-read selected-path diagnostics for the current primary connection.
     PathChanged {
+        /// Stable ID of the connection that emitted the path event.
         connection_id: usize,
     },
+    /// Stop the actor and settle all outstanding work with this reason.
     Shutdown(DeliveryError),
+    /// Request the initial outbound dial if no primary exists.
     StartOutboundDial,
 }
 
 impl PeerSession {
+    /// Spawns the actor and returns its queue/state handle.
+    ///
+    /// Inbound sessions retain an optional global session permit for their
+    /// lifetime. Outbound sessions can start their first dial immediately while
+    /// later connection replacements are still serialized by the actor.
     pub(super) fn spawn(
         peer: EndpointId,
         inner: Arc<TransportInner>,
@@ -171,10 +241,15 @@ impl PeerSession {
         }
     }
 
+    /// Returns the latest externally visible connection state.
     pub(super) fn connection_state(&self) -> ContactConnectionState {
         *self.state.borrow()
     }
 
+    /// Reserves a queue slot and attempts non-blocking delivery admission.
+    ///
+    /// The atomic reservation closes the race between the capacity check and
+    /// `try_send`; both a full and a closed channel release the reservation.
     pub(super) fn try_enqueue(&self, delivery: QueuedDelivery) -> Result<(), DeliveryError> {
         let reserved = self
             .queued
@@ -198,6 +273,7 @@ impl PeerSession {
         }
     }
 
+    /// Hands an inbound connection to the actor without blocking the acceptor.
     pub(super) fn attach_inbound(&self, connection: Connection) {
         let _ = self.control.send(SessionControl::Attach {
             connection,
@@ -205,10 +281,12 @@ impl PeerSession {
         });
     }
 
+    /// Requests the actor's initial outbound connection attempt.
     pub(super) fn request_outbound_dial(&self) {
         let _ = self.control.send(SessionControl::StartOutboundDial);
     }
 
+    /// Requests shutdown and waits for the actor task to finish.
     pub(super) async fn shutdown(&self, reason: DeliveryError) {
         let _ = self.control.send(SessionControl::Shutdown(reason));
         if let Some(join) = self.join.lock().await.take() {
@@ -217,30 +295,49 @@ impl PeerSession {
     }
 }
 
+/// Single-owner state machine for one contact's connection and delivery flow.
 struct SessionActor {
+    /// Remote endpoint identity represented by this actor.
     peer: EndpointId,
+    /// Shared endpoint, allowlist, channels, and concurrency budgets.
     inner: Arc<TransportInner>,
+    /// Receiver for newly queued outgoing deliveries.
     rx: mpsc::Receiver<QueuedDelivery>,
+    /// Receiver for lifecycle and worker control messages.
     control_rx: mpsc::UnboundedReceiver<SessionControl>,
+    /// Sender handed to spawned workers for actor callbacks.
     control: mpsc::UnboundedSender<SessionControl>,
+    /// Inbound session permit held until actor shutdown.
     session_permit: Option<OwnedSemaphorePermit>,
+    /// FIFO of deliveries waiting for a primary connection.
     queue: VecDeque<QueuedDelivery>,
+    /// Current internal lifecycle state.
     state: SessionState,
+    /// Watch sender for application-visible connection state.
     state_tx: watch::Sender<ContactConnectionState>,
     /// Logical session start for the current externally `Connected` period.
     connected_since: Option<StdInstant>,
+    /// Current primary connection, if one is selected.
     primary: Option<ConnectionSlot>,
+    /// Replaced connections still draining active stream work.
     draining: Vec<ConnectionSlot>,
+    /// Current outbound command, including one waiting for a dial.
     active: Option<ActiveDelivery>,
+    /// Whether an asynchronous dial task is currently running.
     dial_in_progress: bool,
+    /// Prevents repeated automatic dials after the first attempt settles.
     dial_attempted: bool,
+    /// Whether this actor should initiate a dial at startup.
     start_outbound: bool,
+    /// Terminal flag checked by the actor loop.
     stopping: bool,
+    /// Shared queue reservation count exposed to `PeerSession`.
     queued: Arc<AtomicUsize>,
 }
 
 impl SessionActor {
     #[allow(clippy::too_many_arguments)]
+    /// Initializes an actor with empty connection and delivery state.
     fn new(
         peer: EndpointId,
         inner: Arc<TransportInner>,
@@ -274,6 +371,7 @@ impl SessionActor {
         }
     }
 
+    /// Runs the actor until its control or delivery channels close.
     async fn run(&mut self) {
         if self.start_outbound {
             self.begin_dial(Instant::now() + self.inner.config.dial_timeout)
@@ -303,6 +401,7 @@ impl SessionActor {
         self.finish_shutdown(DeliveryError::ShutDown).await;
     }
 
+    /// Applies one serialized lifecycle/worker event.
     async fn handle_control(&mut self, control: SessionControl) {
         match control {
             SessionControl::Attach { connection, origin } => {
@@ -440,6 +539,10 @@ impl SessionActor {
         }
     }
 
+    /// Starts the next FIFO delivery if the session has no active worker.
+    ///
+    /// Canceled, expired, removed-contact, and disconnected commands are
+    /// settled locally before another command can occupy the active slot.
     async fn start_next_if_possible(&mut self) {
         if self.active.is_some() {
             return;
@@ -471,6 +574,7 @@ impl SessionActor {
         }
     }
 
+    /// Spawns one bidi-stream worker on the selected primary connection.
     fn spawn_active_delivery(
         &mut self,
         command: QueuedDelivery,
@@ -496,6 +600,7 @@ impl SessionActor {
         }
     }
 
+    /// Rebinds a delivery that was waiting for the first successful connection.
     fn start_pending_delivery(&mut self) {
         let Some(active) = self.active.take() else {
             return;
@@ -514,6 +619,7 @@ impl SessionActor {
         self.active = Some(self.spawn_active_delivery(active.command, primary.connection.clone()));
     }
 
+    /// Starts at most one outbound dial for the actor's lifetime.
     async fn begin_dial(&mut self, deadline: Instant) {
         if self.dial_in_progress || self.stopping || self.dial_attempted {
             return;
@@ -530,6 +636,8 @@ impl SessionActor {
         });
     }
 
+    /// Attaches a connection, selects a deterministic primary, and starts its
+    /// accept/close/path observer tasks.
     async fn attach_connection(&mut self, connection: Connection, origin: ConnectionOrigin) {
         let connection_id = connection.stable_id();
         let candidate_preferred = is_preferred(self.inner.endpoint.id(), self.peer, origin);
@@ -599,6 +707,8 @@ impl SessionActor {
         }
     }
 
+    /// Stops new streams on a replaced connection while allowing active work to
+    /// finish before the connection is closed.
     fn start_draining(&mut self, slot: ConnectionSlot) {
         let _ = slot.stop_accept.send(true);
         logging::log_event(
@@ -618,6 +728,7 @@ impl SessionActor {
         }
     }
 
+    /// Removes a closed connection and fails any delivery that used it.
     async fn connection_closed(&mut self, connection_id: usize, reason: String) {
         let lost_connection = self
             .primary
@@ -686,6 +797,7 @@ impl SessionActor {
         }
     }
 
+    /// Finds a primary or draining slot by stable connection ID.
     fn find_slot_mut(&mut self, connection_id: usize) -> Option<&mut ConnectionSlot> {
         if self
             .primary
@@ -699,6 +811,7 @@ impl SessionActor {
             .find(|slot| slot.connection.stable_id() == connection_id)
     }
 
+    /// Closes draining connections whose active handler counts reached zero.
     fn close_draining_finished(&mut self) {
         let mut keep = Vec::with_capacity(self.draining.len());
         for slot in self.draining.drain(..) {
@@ -711,6 +824,7 @@ impl SessionActor {
         self.draining = keep;
     }
 
+    /// Cancels active/queued work and closes all primary/draining connections.
     async fn finish_shutdown(&mut self, reason: DeliveryError) {
         if self.state != SessionState::Closing {
             self.log_state(SessionState::Closing);
@@ -740,10 +854,12 @@ impl SessionActor {
         self.session_permit.take();
     }
 
+    /// Releases one atomic queue reservation after a command leaves the queue.
     fn release_queued_slot(&self) {
         self.queued.fetch_sub(1, Ordering::AcqRel);
     }
 
+    /// Publishes a state transition only when it differs from the current state.
     fn log_state(&mut self, state: SessionState) {
         if self.state == state {
             return;
@@ -831,6 +947,11 @@ impl SessionActor {
     }
 }
 
+/// Chooses one deterministic connection origin for a pair of endpoint IDs.
+///
+/// The lower endpoint ID prefers an outbound connection and the higher ID
+/// prefers an inbound connection, preventing simultaneous connections from
+/// competing indefinitely for the primary slot.
 fn is_preferred(local: EndpointId, remote: EndpointId, origin: ConnectionOrigin) -> bool {
     match origin {
         ConnectionOrigin::Outbound => local < remote,
@@ -851,6 +972,11 @@ fn should_apply_path_refresh(
     primary_connection_id == Some(event_connection_id) && state == SessionState::Connected
 }
 
+/// Spawns accept, close-monitor, and path-observer tasks for one connection.
+///
+/// These tasks never mutate actor state directly. They emit `SessionControl`
+/// messages so the actor remains the single owner of connection selection and
+/// counters.
 fn spawn_connection_tasks(
     peer: EndpointId,
     inner: Arc<TransportInner>,
@@ -977,6 +1103,7 @@ fn spawn_connection_tasks(
     });
 }
 
+/// Spawns a one-message bidi-stream worker and reports its result to the actor.
 fn spawn_outbound_stream(
     peer: EndpointId,
     inner: Arc<TransportInner>,
@@ -997,6 +1124,11 @@ fn spawn_outbound_stream(
     })
 }
 
+/// Performs the outbound request/response exchange for one queued message.
+///
+/// The operation writes one text envelope, finishes the send half, reads one
+/// receipt/rejection document, and validates that the response uses the same
+/// message ID. A local write or `finish` is not treated as delivery proof.
 async fn run_outbound_stream(
     peer: EndpointId,
     inner: Arc<TransportInner>,
@@ -1117,6 +1249,7 @@ async fn run_outbound_stream(
     }
 }
 
+/// Runs one stream operation until its deadline or shared cancellation wins.
 async fn run_stream_stage<T, E, F>(
     deadline: Instant,
     operation: F,
@@ -1132,6 +1265,12 @@ where
     }
 }
 
+/// Reads, validates, queues, and acknowledges one inbound text stream.
+///
+/// The message is sent to the bounded application queue before the accepted
+/// receipt is written, so the receipt represents local runtime acceptance.
+/// Unknown contacts and malformed requests are reset without entering the
+/// application queue.
 async fn handle_inbound_stream(
     peer: EndpointId,
     inner: Arc<TransportInner>,
@@ -1230,6 +1369,7 @@ async fn handle_inbound_stream(
     );
 }
 
+/// Validates that a remote response is an acceptance/rejection for `expected`.
 fn validate_receipt(
     expected: MessageId,
     frame: ChatFrame,
@@ -1249,6 +1389,7 @@ fn validate_receipt(
     }
 }
 
+/// Converts framing failures into the public delivery error vocabulary.
 fn map_frame_error(error: FrameError) -> DeliveryError {
     match error {
         FrameError::Io(error) => DeliveryError::Transport(error.to_string()),
@@ -1259,12 +1400,14 @@ fn map_frame_error(error: FrameError) -> DeliveryError {
     }
 }
 
+/// Settles a command only if this caller wins its cancellation race.
 async fn finish_command(command: &QueuedDelivery, result: Result<DeliveryReceipt, DeliveryError>) {
     if command.cancellation.cancel() {
         resolve_once(&command.completion, result).await;
     }
 }
 
+/// Settles a command unconditionally during a terminal connection/session stop.
 async fn force_finish_command(
     command: &QueuedDelivery,
     result: Result<DeliveryReceipt, DeliveryError>,
@@ -1273,11 +1416,13 @@ async fn force_finish_command(
     resolve_once(&command.completion, result).await;
 }
 
+/// Resets both halves of a malformed or abandoned bidi stream.
 fn reset_stream(send: &mut iroh::endpoint::SendStream, recv: &mut iroh::endpoint::RecvStream) {
     let _ = send.reset(0u32.into());
     let _ = recv.stop(0u32.into());
 }
 
+/// Resets a stream and records the reason with its correlation IDs.
 fn reset_stream_with_log(
     peer: EndpointId,
     connection_id: usize,
@@ -1298,6 +1443,7 @@ fn reset_stream_with_log(
     );
 }
 
+/// Resets an outbound stream and records its message/stream correlation IDs.
 fn log_outbound_stream_reset(
     peer: EndpointId,
     connection_id: usize,

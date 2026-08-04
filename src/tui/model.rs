@@ -1,3 +1,10 @@
+//! Presentation-facing TUI models derived from domain and runtime events.
+//!
+//! These values are intentionally separate from domain storage. They contain
+//! display state such as unread counts, delivery labels, selected paths, and
+//! in-memory chat transcripts that the TUI can mutate without changing the
+//! persistence or wire model.
+
 use std::{collections::BTreeMap, time::Instant};
 
 use crate::domain::{
@@ -8,7 +15,9 @@ use crate::domain::{
 };
 use crate::protocol::MessageId;
 
+/// Stable key for a contact's TUI-owned transcript and draft state.
 pub type ContactId = PeerId;
+/// Stable index key for a relay row in the current TUI list.
 pub type RelayId = usize;
 
 /// Runtime contact row shown in the sidebar and details panel.
@@ -17,8 +26,11 @@ pub type RelayId = usize;
 /// never restored from contact storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContactView {
+    /// Canonical peer identity displayed and used as the contact key.
     pub peer_id: PeerId,
+    /// Number of incoming messages received while this contact was not active.
     pub unread_count: usize,
+    /// Local runtime connection state for the contact session.
     pub connection_state: ContactConnectionState,
     /// Observed selected transport path for the current connected session.
     pub selected_path: SelectedPath,
@@ -27,6 +39,7 @@ pub struct ContactView {
 }
 
 impl ContactView {
+    /// Creates a view with no unread messages and no active connection.
     pub fn from_peer_id(peer_id: PeerId) -> Self {
         Self {
             peer_id,
@@ -37,53 +50,80 @@ impl ContactView {
         }
     }
 
+    /// Returns the map key used for this contact's local UI state.
     pub fn id(&self) -> ContactId {
         self.peer_id.clone()
     }
 }
 
+/// Display row for one configured relay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayView {
+    /// Position/key used by relay commands.
     pub id: RelayId,
+    /// Relay URL shown in details and compact list form.
     pub url: String,
+    /// Whether the relay is built-in or user-provided.
     pub source: RelaySource,
+    /// Local UI toggle; it is not a proof that a connection currently uses it.
     pub enabled: bool,
 }
 
+/// Which side of a transcript authored a message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub enum MessageSender {
+    /// The local user/application.
     Local,
+    /// The selected contact.
     Contact,
 }
 
+/// Delivery label shown for an outgoing message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeliveryState {
+    /// The message entered the local queue but has no terminal result yet.
     Pending,
+    /// The remote runtime accepted the message frame.
     Delivered,
+    /// The remote runtime rejected the message.
     Rejected,
+    /// The delivery deadline elapsed before a terminal result.
     TimedOut,
+    /// A local transport/session failure prevented delivery.
     Failed,
 }
 
+/// One in-memory transcript row rendered by the chat component.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MessageView {
+    /// Protocol message correlation identifier.
     pub message_id: MessageId,
+    /// Local or remote author marker.
     pub sender: MessageSender,
+    /// Preformatted UTC display label.
     pub timestamp: String,
+    /// Message body held only in the current process transcript.
     pub body: String,
+    /// Outgoing delivery state, or `None` for incoming messages.
     pub delivery: Option<DeliveryState>,
 }
 
+/// Mutable application-facing data rendered by all TUI components.
 #[derive(Clone, Debug)]
 pub struct TuiData {
+    /// Local peer identity shown by the identity overlay and copy action.
     pub own_peer_id: PeerId,
+    /// Sorted contact rows and their runtime diagnostics.
     pub contacts: Vec<ContactView>,
+    /// Relay rows currently visible in the sidebar.
     pub relays: Vec<RelayView>,
+    /// In-memory message transcripts keyed by contact ID.
     pub chats: BTreeMap<ContactId, Vec<MessageView>>,
 }
 
 impl TuiData {
+    /// Builds initial contact views and marks startup contacts as connecting.
     pub fn from_contacts(own_peer_id: PeerId, contacts: Vec<Contact>) -> Self {
         Self {
             own_peer_id,
@@ -102,6 +142,7 @@ impl TuiData {
 }
 
 /// Compact display form for sidebar and chat titles.
+/// Returns a compact first/last segment representation of a peer ID.
 pub fn short_peer_id(peer_id: &PeerId) -> String {
     let value = peer_id.as_str();
     let chars: Vec<char> = value.chars().collect();
@@ -133,6 +174,7 @@ pub fn fit_peer_id(value: &str, max_chars: usize) -> String {
     format!("{first}…{last}")
 }
 
+/// Formats a Unix-millisecond timestamp as a compact UTC clock label.
 pub fn utc_time_label(unix_ms: i64) -> String {
     let seconds = unix_ms.div_euclid(1_000);
     let hours = seconds.div_euclid(3_600).rem_euclid(24);

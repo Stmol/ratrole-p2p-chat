@@ -1,3 +1,8 @@
+//! Top-level frame composition for the typed TUI components.
+//!
+//! This module calculates the layout once, builds immutable component props at
+//! the application boundary, and delegates each visible region to its renderer.
+
 use ratatui::{
     Frame,
     style::Style,
@@ -10,6 +15,7 @@ use super::{
     layout::{LayoutMode, calculate_layout_with_spec},
 };
 
+/// Renders one complete TUI frame from an immutable application snapshot.
 pub fn render(frame: &mut Frame, app: &TuiApp) {
     let config = app.config();
     frame.render_widget(

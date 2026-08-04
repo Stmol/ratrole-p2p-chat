@@ -1,3 +1,9 @@
+//! Contact and relay diagnostic details renderer.
+//!
+//! Details are derived from immutable props. Connection/path labels distinguish
+//! local runtime observations from unavailable state and never imply remote
+//! presence or relay health checks that the transport has not performed.
+
 use std::time::Duration;
 
 use ratatui::{
@@ -23,6 +29,7 @@ use crate::tui::{
 const UNAVAILABLE: &str = "unavailable";
 const DETECTING: &str = "detecting";
 
+/// Renders contact or relay details for the active sidebar tab.
 pub fn render_details(
     frame: &mut Frame,
     area: Rect,
@@ -58,6 +65,7 @@ pub fn render_details(
     );
 }
 
+/// Formats the selected contact's identity and runtime diagnostics.
 fn contact_details(props: &DetailsProps<'_>, theme: &UiTheme) -> Text<'static> {
     let Some(contact) = props.contact else {
         return Text::from(Line::from(Span::styled(
@@ -90,7 +98,7 @@ fn contact_details(props: &DetailsProps<'_>, theme: &UiTheme) -> Text<'static> {
     ])
 }
 
-/// Formats state-dependent Path / Address / Connected-for values for the details panel.
+/// Formats state-dependent path, address, and duration values.
 fn diagnostic_labels(
     state: ContactConnectionState,
     selected_path: &SelectedPath,
@@ -121,6 +129,7 @@ fn diagnostic_labels(
     }
 }
 
+/// Formats the selected relay's configuration metadata.
 fn relay_details(props: &DetailsProps<'_>, theme: &UiTheme) -> Text<'static> {
     let Some(relay) = props.relay else {
         return Text::from(Line::from(Span::styled(

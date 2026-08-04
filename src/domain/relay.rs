@@ -1,10 +1,14 @@
+//! Relay configuration values shared by the application and transport layers.
+
 use serde::{Deserialize, Serialize};
 
 /// Distinguishes shipped bootstrap relay configuration from user additions.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelaySource {
+    /// Relay included in the binary's bootstrap set.
     BuiltIn,
+    /// Relay supplied by the user or local configuration.
     User,
 }
 
@@ -14,7 +18,9 @@ pub const BUILT_IN_RELAY_SET_VERSION: u8 = 1;
 /// A relay endpoint available to the transport layer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RelayServer {
+    /// Relay URL understood by the Iroh transport configuration.
     pub url: String,
+    /// Whether this relay came from the shipped set or user configuration.
     pub source: RelaySource,
 }
 

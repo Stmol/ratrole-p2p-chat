@@ -1,3 +1,5 @@
+//! Footer status and context-sensitive key hint renderer.
+
 use ratatui::{
     Frame,
     style::Style,
@@ -12,6 +14,7 @@ use crate::tui::{
     theme::UiTheme,
 };
 
+/// Renders the current status message or a width-appropriate key hint.
 pub fn render_footer(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
@@ -34,6 +37,7 @@ pub fn render_footer(
     );
 }
 
+/// Builds the full, compact, or hidden footer hint for the available width.
 pub(crate) fn footer_hint(
     props: &FooterProps<'_>,
     width: u16,

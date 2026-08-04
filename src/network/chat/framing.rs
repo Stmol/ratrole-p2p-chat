@@ -1,3 +1,10 @@
+//! Length-delimited protocol documents carried over one QUIC bidi stream.
+//!
+//! Each document starts with a four-byte big-endian length, followed by one
+//! bounded CBOR envelope. The helpers intentionally support both persistent
+//! stream readers and the single-document request/response streams used by the
+//! chat session actor.
+
 use std::io;
 
 use thiserror::Error;
@@ -5,18 +12,24 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::protocol::{MAX_FRAME_BYTES, ProtocolError, WireEnvelope, decode, encode};
 
+/// Errors raised while framing or decoding one stream document.
 #[derive(Debug, Error)]
 pub(super) enum FrameError {
+    /// The underlying async stream read or write failed.
     #[error("stream I/O failed: {0}")]
     Io(#[from] io::Error),
+    /// The length prefix exceeded the protocol allocation limit.
     #[error("declared CBOR document is {declared} bytes; maximum is {MAX_FRAME_BYTES}")]
     DeclaredFrameTooLarge { declared: usize },
+    /// A single-document request/response stream contained extra bytes.
     #[error("stream contains bytes after the complete CBOR document")]
     TrailingData,
+    /// The framed bytes were not a valid protocol envelope.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 }
 
+/// Writes one validated envelope with its big-endian byte-length prefix.
 pub(super) async fn write_document<W>(
     writer: &mut W,
     envelope: &WireEnvelope,
@@ -32,6 +45,10 @@ where
     Ok(())
 }
 
+/// Reads one length-prefixed envelope without waiting for stream EOF.
+///
+/// The declared size is checked before allocating the body buffer. This helper
+/// is suitable for streams that contain multiple back-to-back documents.
 pub(super) async fn read_document<R>(reader: &mut R) -> Result<WireEnvelope, FrameError>
 where
     R: AsyncRead + Unpin,
@@ -47,6 +64,7 @@ where
     Ok(decode(&bytes)?)
 }
 
+/// Reads exactly one envelope and rejects any trailing stream byte.
 pub(super) async fn read_single_document<R>(reader: &mut R) -> Result<WireEnvelope, FrameError>
 where
     R: AsyncRead + Unpin,

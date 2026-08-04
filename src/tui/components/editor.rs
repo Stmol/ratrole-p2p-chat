@@ -1,30 +1,44 @@
+//! Unicode-safe text editor used by chat and modal input.
+//!
+//! Cursor positions are counted in Unicode scalar values, then converted to
+//! byte offsets only at the mutation boundary so insert/delete operations never
+//! split a UTF-8 code point.
+
+/// Small Unicode-safe editor shared by chat and modal text entry.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TextEditor {
+    /// Owned UTF-8 text being edited.
     text: String,
+    /// Character-indexed cursor position in the text.
     cursor: usize,
 }
 
 impl TextEditor {
+    /// Borrows the current editor text.
     pub(crate) fn text(&self) -> &str {
         &self.text
     }
 
+    /// Returns the character-indexed cursor position.
     pub(crate) fn cursor(&self) -> usize {
         self.cursor
     }
 
+    /// Inserts one Unicode scalar at the cursor and advances it.
     pub(crate) fn insert(&mut self, ch: char) {
         let byte = self.byte_at_cursor();
         self.text.insert(byte, ch);
         self.cursor += 1;
     }
 
+    /// Inserts pasted text at the cursor and advances by its character count.
     pub(crate) fn paste(&mut self, text: &str) {
         let byte = self.byte_at_cursor();
         self.text.insert_str(byte, text);
         self.cursor += text.chars().count();
     }
 
+    /// Deletes the character immediately before the cursor, if present.
     pub(crate) fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
@@ -35,6 +49,7 @@ impl TextEditor {
         self.cursor -= 1;
     }
 
+    /// Deletes the character at the cursor, if present.
     pub(crate) fn delete(&mut self) {
         if self.cursor >= self.text.chars().count() {
             return;
@@ -44,6 +59,7 @@ impl TextEditor {
         self.text.replace_range(start..end, "");
     }
 
+    /// Moves the cursor by a saturating signed character delta.
     pub(crate) fn move_cursor(&mut self, delta: i16) {
         let len = self.text.chars().count();
         self.cursor = if delta.is_negative() {
@@ -53,18 +69,22 @@ impl TextEditor {
         };
     }
 
+    /// Moves the cursor to the first character position.
     pub(crate) fn move_to_start(&mut self) {
         self.cursor = 0;
     }
 
+    /// Moves the cursor after the final character.
     pub(crate) fn move_to_end(&mut self) {
         self.cursor = self.text.chars().count();
     }
 
+    /// Converts the current character cursor into a UTF-8 byte offset.
     fn byte_at_cursor(&self) -> usize {
         self.byte_at(self.cursor)
     }
 
+    /// Returns the byte offset of a character position, clamping at string end.
     fn byte_at(&self, cursor: usize) -> usize {
         self.text
             .char_indices()

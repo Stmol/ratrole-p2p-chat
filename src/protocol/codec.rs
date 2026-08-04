@@ -1,9 +1,20 @@
+//! Size-bounded CBOR serialization for complete chat envelopes.
+//!
+//! The codec does not read from a stream and does not decide whether an Iroh
+//! peer is allowed to communicate. It only converts already-authenticated
+//! protocol values to and from a single bounded CBOR document.
+
 use thiserror::Error;
 
 use super::{ValidationError, WireEnvelope};
 
+/// Maximum encoded CBOR document size accepted by the protocol boundary.
 pub const MAX_FRAME_BYTES: usize = 32 * 1024;
 
+/// Validates and encodes one envelope into a bounded CBOR document.
+///
+/// Validation runs before serialization and the encoded result is checked
+/// again because a valid text body can still produce an oversized document.
 pub fn encode(envelope: &WireEnvelope) -> Result<Vec<u8>, ProtocolError> {
     envelope.validate().map_err(ProtocolError::Validation)?;
     let bytes =
@@ -14,6 +25,10 @@ pub fn encode(envelope: &WireEnvelope) -> Result<Vec<u8>, ProtocolError> {
     Ok(bytes)
 }
 
+/// Decodes one complete bounded CBOR document into a validated envelope.
+///
+/// Malformed input, unknown fields, unsupported variants, and invalid payloads
+/// are reported as protocol errors rather than being partially accepted.
 pub fn decode(bytes: &[u8]) -> Result<WireEnvelope, ProtocolError> {
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(ProtocolError::FrameTooLarge);
@@ -24,14 +39,19 @@ pub fn decode(bytes: &[u8]) -> Result<WireEnvelope, ProtocolError> {
     Ok(envelope)
 }
 
+/// Errors raised while encoding or decoding a chat document.
 #[derive(Debug, Error)]
 pub enum ProtocolError {
+    /// The serialized document exceeds [`MAX_FRAME_BYTES`].
     #[error("CBOR frame exceeds the {MAX_FRAME_BYTES}-byte limit")]
     FrameTooLarge,
+    /// CBOR is malformed or contains fields/variants outside the strict schema.
     #[error("CBOR frame is malformed or contains unsupported fields")]
     MalformedCbor,
+    /// The serializer failed after protocol validation succeeded.
     #[error("CBOR frame cannot be encoded: {0}")]
     Encoding(String),
+    /// The decoded envelope violates a protocol-level field constraint.
     #[error(transparent)]
     Validation(#[from] ValidationError),
 }

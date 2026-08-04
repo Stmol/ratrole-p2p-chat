@@ -1,3 +1,9 @@
+//! Terminal UI lifecycle, event loop, and component composition.
+//!
+//! The TUI owns presentation state and terminal resources. It sends `UiEffect`
+//! values to the application session and applies incoming `UiCommand` values
+//! through `TuiApp`; network/storage operations never run inside renderers.
+
 mod action;
 mod app;
 mod component;
@@ -26,6 +32,11 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 pub(crate) use app::{TuiApp, UiCommand, UiEffect};
 pub(crate) use model::{ContactView, DeliveryState, TuiData};
 
+/// Runs the terminal UI until the application requests quit.
+///
+/// This function enables raw mode and the alternate screen, runs the event
+/// loop, and restores terminal state even when drawing or input returns an
+/// error. The session bridge remains responsible for interpreting effects.
 pub(crate) fn run(
     data: TuiData,
     effect_tx: tokio::sync::mpsc::Sender<UiEffect>,
@@ -59,6 +70,7 @@ pub(crate) fn run(
     }
 }
 
+/// Processes commands, animation timers, terminal input, and rendering ticks.
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     data: TuiData,
@@ -127,8 +139,10 @@ fn run_loop(
     Ok(())
 }
 
+/// Maximum number of queued application commands applied per frame.
 const COMMAND_DRAIN_LIMIT: usize = 64;
 
+/// Applies a bounded batch of incoming commands before the next render.
 fn drain_commands(app: &mut TuiApp, command_rx: &std::sync::mpsc::Receiver<UiCommand>) {
     for _ in 0..COMMAND_DRAIN_LIMIT {
         match command_rx.try_recv() {
@@ -139,6 +153,7 @@ fn drain_commands(app: &mut TuiApp, command_rx: &std::sync::mpsc::Receiver<UiCom
     }
 }
 
+/// Sends one pending effect to the background session without blocking the UI.
 fn dispatch_effect(app: &mut TuiApp, effect_tx: &tokio::sync::mpsc::Sender<UiEffect>) {
     let Some(effect) = app.take_effect() else {
         return;
@@ -170,6 +185,7 @@ fn dispatch_effect(app: &mut TuiApp, effect_tx: &tokio::sync::mpsc::Sender<UiEff
     }
 }
 
+/// Restores raw-mode, bracketed-paste, alternate-screen, and cursor state.
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
     disable_raw_mode()?;

@@ -1,3 +1,9 @@
+//! Bridge between TUI effects, persisted contacts, and the live chat transport.
+//!
+//! [`ChatSession`] owns one background [`SessionRuntime`] task. The runtime
+//! serializes contact persistence and UI effects while forwarding incoming
+//! messages and connection observations back to the TUI through commands.
+
 use std::time::Instant;
 
 use anyhow::Result;
@@ -18,12 +24,23 @@ use crate::{
     tui::{ContactView, DeliveryState, UiCommand, UiEffect},
 };
 
+/// Background owner for one application's chat transport and UI bridge.
+///
+/// Dropping this value does not synchronously tear down the transport; callers
+/// should use [`ChatSession::shutdown`] so the runtime can close its endpoint
+/// and join its task explicitly.
 pub(crate) struct ChatSession {
+    /// One-shot signal used to request runtime shutdown.
     shutdown_tx: oneshot::Sender<()>,
+    /// Join handle for the task that owns the session runtime.
     join: JoinHandle<Result<()>>,
 }
 
 impl ChatSession {
+    /// Starts a chat session with the default transport configuration.
+    ///
+    /// The repository and channels are moved into the background runtime, which
+    /// requires the repository to be thread-safe and have a `'static` lifetime.
     #[allow(dead_code)]
     pub(crate) async fn start<R>(
         secret_key: SecretKey,
@@ -46,6 +63,11 @@ impl ChatSession {
         .await
     }
 
+    /// Starts a chat session with an explicit transport configuration.
+    ///
+    /// Contacts are converted into the transport allowlist before the runtime
+    /// task starts. A transport startup failure is returned without claiming
+    /// that the session is running.
     pub(crate) async fn start_with_config<R>(
         secret_key: SecretKey,
         contacts: Vec<Contact>,
@@ -96,6 +118,11 @@ impl ChatSession {
         Ok(Self { shutdown_tx, join })
     }
 
+    /// Requests shutdown, waits for the runtime task, and returns its result.
+    ///
+    /// The join handle is consumed exactly once. A task cancellation is treated
+    /// as a clean stop, while a panic or transport error is surfaced to the
+    /// application.
     pub(crate) async fn shutdown(self) -> Result<()> {
         logging::log_event(
             "session",
@@ -117,19 +144,37 @@ impl ChatSession {
     }
 }
 
+/// Mutable event loop state owned by the background chat-session task.
+///
+/// The runtime receives UI effects and transport events from asynchronous
+/// channels, then emits synchronous UI commands. It is the only owner that
+/// mutates the in-memory contact snapshot used for persistence decisions.
 struct SessionRuntime<R> {
+    /// Endpoint owner whose shutdown is coordinated by this runtime.
     transport: ChatTransport,
+    /// Client view used for state-sensitive sends and contact checks.
     client: ChatClient,
+    /// Incoming messages accepted by the transport.
     incoming_rx: mpsc::Receiver<IncomingText>,
+    /// Runtime connection observations from peer sessions.
     connection_events_rx: mpsc::UnboundedReceiver<PeerConnectionEvent>,
+    /// Effects emitted by the TUI.
     effect_rx: mpsc::Receiver<UiEffect>,
+    /// Synchronous command channel consumed by the TUI loop.
     command_tx: std::sync::mpsc::Sender<UiCommand>,
+    /// Current persisted contact snapshot used for stale-event guards.
     contacts: Vec<Contact>,
+    /// Repository used for contact-list replacements.
     repository: R,
+    /// One-shot shutdown receiver for the runtime loop.
     shutdown_rx: oneshot::Receiver<()>,
 }
 
 impl<R: ContactRepository> SessionRuntime<R> {
+    /// Selects over shutdown, transport input, connection events, and UI effects.
+    ///
+    /// When the loop ends, transport shutdown is awaited before the result is
+    /// returned so the application does not leave the endpoint owner detached.
     async fn run(mut self) -> Result<()> {
         logging::log_event("session", "session_runtime_started", LogFields::default());
         loop {
@@ -171,6 +216,10 @@ impl<R: ContactRepository> SessionRuntime<R> {
         result
     }
 
+    /// Forwards connection changes only for contacts still present locally.
+    ///
+    /// This guard prevents a late event from resurrecting a removed contact in
+    /// the TUI after the allowlist and repository have already been updated.
     fn handle_connection_event(&self, event: PeerConnectionEvent) {
         if !self
             .contacts
@@ -195,6 +244,11 @@ impl<R: ContactRepository> SessionRuntime<R> {
         });
     }
 
+    /// Applies one UI effect and emits the corresponding UI command or status.
+    ///
+    /// Clipboard access is performed here rather than in a renderer, keeping
+    /// rendering side-effect free and making persistence/transport failures
+    /// visible through the same command channel as normal updates.
     async fn handle_effect(&mut self, effect: UiEffect) {
         log_ui_effect(&effect);
         match effect {
@@ -219,10 +273,18 @@ impl<R: ContactRepository> SessionRuntime<R> {
         }
     }
 
+    /// Sends a command to the TUI without allowing a dropped receiver to panic
+    /// the background session.
     fn emit(&self, command: UiCommand) {
         emit_command(&self.command_tx, command);
     }
 
+    /// Validates and queues outgoing text, then watches its remote receipt.
+    ///
+    /// A successful queue admission emits `OutgoingQueued`; a separate task
+    /// waits for the transport completion and emits `OutgoingSettled`. The
+    /// completion represents remote runtime acceptance, not a read receipt or
+    /// durable storage acknowledgement.
     async fn send_text(&self, peer_id: PeerId, body: String) {
         let queued_body = body.clone();
         let request_started = Instant::now();
@@ -291,6 +353,11 @@ impl<R: ContactRepository> SessionRuntime<R> {
         }
     }
 
+    /// Persists a new contact before publishing it to the TUI.
+    ///
+    /// Duplicate contacts are reported without rewriting storage. If storage
+    /// succeeds but the live allowlist update fails, the user is told that the
+    /// durable list changed while the current session could not be updated.
     async fn persist_contact(&mut self, peer_id: PeerId) {
         logging::log_event(
             "session",
@@ -342,6 +409,11 @@ impl<R: ContactRepository> SessionRuntime<R> {
         }
     }
 
+    /// Removes a contact from storage and the live allowlist when safe.
+    ///
+    /// Removal is blocked while the initial connection check is still pending,
+    /// because the TUI uses that state to prevent a stale enabled action from
+    /// changing the contact lifecycle mid-dial.
     async fn remove_contact(&mut self, peer_id: PeerId) {
         logging::log_event(
             "session",
@@ -401,6 +473,7 @@ impl<R: ContactRepository> SessionRuntime<R> {
     }
 }
 
+/// Emits one UI command while recording the command metadata without its body.
 fn emit_command(command_tx: &std::sync::mpsc::Sender<UiCommand>, command: UiCommand) {
     log_ui_command(&command);
     if command_tx.send(command).is_err() {
@@ -408,6 +481,7 @@ fn emit_command(command_tx: &std::sync::mpsc::Sender<UiCommand>, command: UiComm
     }
 }
 
+/// Maps the transport completion outcome to the TUI's compact delivery state.
 async fn map_delivery(handle: DeliveryHandle) -> DeliveryState {
     match handle.wait().await {
         Ok(_) => DeliveryState::Delivered,
@@ -417,6 +491,8 @@ async fn map_delivery(handle: DeliveryHandle) -> DeliveryState {
     }
 }
 
+/// Converts a delivery error into user-facing status text without exposing
+/// transport internals in the TUI.
 fn send_error_message(error: &DeliveryError) -> &'static str {
     match error {
         DeliveryError::Validation(_) => "Message is too long",
@@ -431,6 +507,7 @@ fn send_error_message(error: &DeliveryError) -> &'static str {
     }
 }
 
+/// Records a UI effect using safe metadata such as peer and byte count.
 fn log_ui_effect(effect: &UiEffect) {
     let (event, fields) = match effect {
         UiEffect::PersistContact(peer_id) => (
@@ -453,6 +530,7 @@ fn log_ui_effect(effect: &UiEffect) {
     logging::log_event("session", event, fields);
 }
 
+/// Records a UI command using IDs, statuses, and byte counts rather than text.
 fn log_ui_command(command: &UiCommand) {
     let (event, fields) = match command {
         UiCommand::ContactAdded(contact) => (
@@ -542,6 +620,7 @@ fn log_ui_command(command: &UiCommand) {
     logging::log_event("session", event, fields);
 }
 
+/// Converts a delivery state to the stable log label used by diagnostics.
 fn delivery_state_name(delivery: DeliveryState) -> &'static str {
     match delivery {
         DeliveryState::Pending => "pending",
@@ -552,6 +631,7 @@ fn delivery_state_name(delivery: DeliveryState) -> &'static str {
     }
 }
 
+/// Returns elapsed monotonic milliseconds with saturation on conversion.
 fn elapsed_ms(started_at: Instant) -> u64 {
     started_at
         .elapsed()
@@ -560,6 +640,10 @@ fn elapsed_ms(started_at: Instant) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Builds a contact-list candidate without mutating the current snapshot.
+///
+/// Persistence and transport replacement consume the candidate first; the
+/// in-memory list is updated only after both operations succeed.
 fn add_contact_candidate(contacts: &[Contact], peer_id: &PeerId) -> Option<Vec<Contact>> {
     if contacts.iter().any(|contact| contact.peer_id() == peer_id) {
         return None;
@@ -569,6 +653,7 @@ fn add_contact_candidate(contacts: &[Contact], peer_id: &PeerId) -> Option<Vec<C
     Some(candidate)
 }
 
+/// Builds a contact-list candidate with one peer removed, if present.
 fn remove_contact_candidate(contacts: &[Contact], peer_id: &PeerId) -> Option<Vec<Contact>> {
     let candidate = contacts
         .iter()
@@ -578,11 +663,19 @@ fn remove_contact_candidate(contacts: &[Contact], peer_id: &PeerId) -> Option<Ve
     (candidate.len() != contacts.len()).then_some(candidate)
 }
 
+/// Failure categories for the two-phase contact update.
 enum PersistError {
+    /// The durable repository rejected the candidate snapshot.
     Repository(anyhow::Error),
+    /// The live transport allowlist could not apply the persisted snapshot.
     Transport,
 }
 
+/// Persists a contact snapshot, updates the live allowlist, then swaps memory.
+///
+/// The order ensures the in-memory list never claims a durable or transport
+/// state that was not successfully established. A transport failure leaves the
+/// repository changed and reports that partial outcome to the caller.
 async fn replace_contacts<R: ContactRepository>(
     transport: &ChatTransport,
     repository: &R,

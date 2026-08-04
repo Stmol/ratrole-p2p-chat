@@ -1,3 +1,9 @@
+//! Development file-backed device-secret storage.
+//!
+//! This backend exists for local development and tests. It validates the exact
+//! Iroh secret length, creates the file atomically without overwriting an
+//! existing identity, and applies owner-only permissions on Unix platforms.
+
 use std::{
     fs,
     io::Write,
@@ -11,20 +17,27 @@ use zeroize::Zeroizing;
 use super::keyring::DeviceKeyStore;
 
 pub struct FileDeviceKeyStore {
+    /// Exact path of the file containing the serialized 32-byte device secret.
     path: PathBuf,
 }
 
 impl FileDeviceKeyStore {
+    /// Creates a file-backed key store for `path`.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
+    /// Returns the configured key-file path.
     pub fn path(&self) -> &Path {
         &self.path
     }
 }
 
 impl DeviceKeyStore for FileDeviceKeyStore {
+    /// Loads a key, returning `None` when the file has not been created yet.
+    ///
+    /// Existing files must contain exactly 32 bytes; malformed lengths are
+    /// rejected instead of being truncated or padded.
     fn load(&self) -> Result<Option<Zeroizing<[u8; 32]>>> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -52,6 +65,11 @@ impl DeviceKeyStore for FileDeviceKeyStore {
         Ok(Some(Zeroizing::new(bytes)))
     }
 
+    /// Creates the key file with private permissions and refuses replacement.
+    ///
+    /// The secret is written to a temporary file in the target directory and
+    /// persisted with `persist_noclobber`, so a second bootstrap cannot replace
+    /// an established local identity.
     fn save(&self, secret: &Zeroizing<[u8; 32]>) -> Result<()> {
         let parent = self
             .path
@@ -91,6 +109,8 @@ impl DeviceKeyStore for FileDeviceKeyStore {
     }
 }
 
+/// Applies owner-only permissions where the target platform exposes Unix mode
+/// bits. Non-Unix platforms leave their platform-specific default unchanged.
 fn set_private_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {

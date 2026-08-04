@@ -1,3 +1,9 @@
+//! Versioned TOML persistence for the local one-way contact list.
+//!
+//! Contact writes are sorted, duplicate-free, and written through a temporary
+//! file before replacement. Loading validates the version and rejects duplicate
+//! peer IDs so malformed state cannot silently change the allowlist.
+
 use std::{
     collections::HashSet,
     io::Write,
@@ -10,31 +16,45 @@ use serde::{Deserialize, Serialize};
 use crate::domain::contact::Contact;
 
 #[derive(Deserialize, Serialize)]
+/// On-disk envelope for the contact list.
 struct ContactsFile {
+    /// Format version used to select a compatible decoder.
     version: u8,
+    /// Contacts stored in the local one-way list.
     contacts: Vec<Contact>,
 }
 
+/// Persistence contract for the local contact list.
 pub trait ContactRepository {
+    /// Loads contacts, returning an empty list when no file exists.
     fn load(&self) -> Result<Vec<Contact>>;
+    /// Replaces the stored contact list with the supplied snapshot.
     fn replace(&self, contacts: &[Contact]) -> Result<()>;
 }
 
+/// TOML-backed implementation of [`ContactRepository`].
 pub struct TomlContactRepository {
+    /// Path of the versioned contacts document.
     path: PathBuf,
 }
 
 impl TomlContactRepository {
+    /// Creates a repository rooted at `path`.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
+    /// Returns the configured contacts-file path.
     pub fn path(&self) -> &Path {
         &self.path
     }
 }
 
 impl ContactRepository for TomlContactRepository {
+    /// Reads, parses, version-checks, and duplicate-checks the contact file.
+    ///
+    /// A missing file is a valid first-run state. Invalid TOML, unsupported
+    /// versions, and duplicate peer IDs are returned as errors.
     fn load(&self) -> Result<Vec<Contact>> {
         let contents = match std::fs::read_to_string(&self.path) {
             Ok(contents) => contents,
@@ -69,6 +89,8 @@ impl ContactRepository for TomlContactRepository {
         Ok(document.contacts)
     }
 
+    /// Sorts and de-duplicates a contact snapshot before atomically replacing
+    /// the TOML file.
     fn replace(&self, contacts: &[Contact]) -> Result<()> {
         let mut contacts = contacts.to_vec();
         contacts.sort_by(|left, right| left.peer_id().as_str().cmp(right.peer_id().as_str()));

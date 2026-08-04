@@ -1,3 +1,9 @@
+//! Context menus, confirmations, and identity/contact modal renderers.
+//!
+//! Overlay state is temporary presentation state. The renderer shows disabled
+//! actions and validation errors from typed props, while `TuiApp` decides which
+//! action emits a persistence/effect command.
+
 use ratatui::{
     Frame,
     layout::Rect,
@@ -15,38 +21,59 @@ use crate::tui::{
     theme::UiTheme,
 };
 
+/// Action available from a context menu or confirmation modal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MenuAction {
+    /// Copy the local peer identity to the clipboard.
     CopyOwnId,
+    /// Open the add-contact text editor.
     AddContact,
+    /// Remove one local contact.
     RemoveContact(ContactId),
+    /// Toggle one relay's local enabled flag.
     ToggleRelay(usize),
+    /// Remove one user-provided relay.
     RemoveRelay(usize),
+    /// Clear the in-memory transcript for one contact.
     ClearChat(ContactId),
 }
 
+/// Context-menu entries and their current selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ContextMenu {
+    /// `(action, label, enabled)` entries rendered in order.
     pub actions: Vec<(MenuAction, &'static str, bool)>,
+    /// Selected entry index.
     pub selected: usize,
 }
 
+/// Currently visible modal/overlay state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Overlay {
+    /// Context menu for the current focus.
     Context(ContextMenu),
+    /// Add-contact editor and optional inline parse error.
     AddContact {
+        /// Unicode-safe endpoint-ID editor.
         editor: TextEditor,
+        /// Validation error shown below the draft.
         error: Option<String>,
     },
+    /// First-run identity modal containing the complete local endpoint ID.
     FirstRunIdentity {
+        /// Local peer identity offered for copying/sharing.
         peer_id: PeerId,
     },
+    /// Confirmation prompt for a destructive or state-changing menu action.
     Confirm {
+        /// Action awaiting confirmation.
         action: MenuAction,
+        /// Whether the Confirm choice is selected rather than Cancel.
         confirm_selected: bool,
     },
 }
 
+/// Renders the currently active overlay over the base TUI frame.
 pub fn render_overlay(
     frame: &mut Frame,
     area: Rect,
@@ -76,6 +103,7 @@ pub fn render_overlay(
     }
 }
 
+/// Renders a context menu with disabled-state explanations.
 fn render_context(
     frame: &mut Frame,
     area: Rect,
@@ -146,6 +174,7 @@ fn render_context(
     );
 }
 
+/// Renders the endpoint-ID editor and any validation message.
 fn render_add_contact(
     frame: &mut Frame,
     area: Rect,
@@ -241,6 +270,7 @@ fn draft_line(draft: &str, cursor: usize, width: usize, theme: &UiTheme) -> Line
     }
 }
 
+/// Renders the first-run identity/share modal.
 fn render_first_run(
     frame: &mut Frame,
     area: Rect,
@@ -280,6 +310,7 @@ fn render_first_run(
     );
 }
 
+/// Renders the two-choice confirmation modal for a menu action.
 fn render_confirm(
     frame: &mut Frame,
     area: Rect,
@@ -344,6 +375,7 @@ fn confirm_choice_span(
     }
 }
 
+/// Centers a modal while clamping it to the available terminal rectangle.
 fn modal_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
     let width = preferred_width.min(area.width.saturating_sub(2)).max(1);
     let height = preferred_height.min(area.height.saturating_sub(2)).max(1);

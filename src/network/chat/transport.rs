@@ -1,3 +1,11 @@
+//! Iroh endpoint binding, connection admission, and transport shutdown.
+//!
+//! [`TransportInner`] is the shared owner of the endpoint, contact allowlist,
+//! channels, per-contact sessions, and concurrency budgets. The public
+//! [`super::ChatTransport`] owns the accept task and endpoint lifecycle, while
+//! [`super::ChatClient`] uses the same state to query readiness and enqueue
+//! messages.
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -30,16 +38,27 @@ use crate::logging::{self, LogFields};
 use crate::network::identity::peer_id_to_endpoint_id;
 use crate::protocol::{ChatFrame, MessageId, RejectionCode, WireEnvelope};
 
+/// Shared transport state used by the endpoint owner and per-peer actors.
 pub(super) struct TransportInner {
+    /// Bound Iroh endpoint used for dialing and accepting connections.
     pub(super) endpoint: Endpoint,
+    /// Authenticated peer allowlist shared with inbound handlers.
     pub(super) contacts: ContactAllowlist,
+    /// Bounded channel carrying accepted text frames to the application.
     pub(super) incoming_tx: mpsc::Sender<IncomingText>,
+    /// Unbounded channel carrying runtime connection observations.
     pub(super) connection_events_tx: mpsc::UnboundedSender<super::PeerConnectionEvent>,
+    /// Exactly one logical peer session per currently allowed endpoint ID.
     pub(super) sessions: Mutex<HashMap<EndpointId, PeerSession>>,
+    /// Budget for distinct inbound peer sessions.
     pub(super) inbound_sessions: Arc<Semaphore>,
+    /// Budget for concurrent inbound bidi-stream handlers.
     pub(super) inbound_stream_handlers: Arc<Semaphore>,
+    /// Budget for connection admission tasks awaiting authentication.
     pub(super) inbound_connection_admissions: Arc<Semaphore>,
+    /// Budget for concurrent outbound dials.
     pub(super) outbound_dials: Arc<Semaphore>,
+    /// Immutable transport policy used by all sessions.
     pub(super) config: ChatTransportConfig,
     #[cfg(test)]
     pub(super) test_routes: Mutex<HashMap<EndpointId, EndpointAddr>>,
@@ -50,6 +69,7 @@ pub(super) struct TransportInner {
 }
 
 impl TransportInner {
+    /// Creates shared state and all concurrency budgets for one endpoint.
     pub(super) fn new(
         endpoint: Endpoint,
         contacts: ContactAllowlist,
@@ -77,6 +97,11 @@ impl TransportInner {
         }
     }
 
+    /// Dials one peer under the shared outbound-dial budget and deadline.
+    ///
+    /// The permit covers both waiting for capacity and the Iroh connect call,
+    /// preventing a large contact list from creating unbounded simultaneous
+    /// handshake work.
     pub(super) async fn connect_for(
         &self,
         peer: EndpointId,
@@ -134,6 +159,10 @@ impl TransportInner {
         Ok(connection)
     }
 
+    /// Resolves the endpoint address used by a dial.
+    ///
+    /// Tests may install an explicit loopback route; production dials use an
+    /// `EndpointAddr` containing only the target endpoint identity.
     async fn dial_addr_for(&self, peer: EndpointId) -> EndpointAddr {
         #[cfg(test)]
         {
@@ -144,6 +173,11 @@ impl TransportInner {
         EndpointAddr::new(peer)
     }
 
+    /// Emits a correlation-safe snapshot of the connection's selected path and
+    /// transport counters.
+    ///
+    /// The configured path mode and observed selected path are logged
+    /// separately; no message body or secret is included.
     pub(super) fn log_connection_snapshot(
         &self,
         component: &'static str,
@@ -185,10 +219,12 @@ impl TransportInner {
         logging::log_event(component, event, fields);
     }
 
+    /// Publishes one runtime connection event without blocking the session actor.
     pub(super) fn emit_connection_event(&self, event: super::PeerConnectionEvent) {
         let _ = self.connection_events_tx.send(event);
     }
 
+    /// Returns the existing peer session or creates a bounded inbound session.
     async fn session_for_inbound(self: &Arc<Self>, peer: EndpointId) -> Option<PeerSession> {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(&peer) {
@@ -200,6 +236,8 @@ impl TransportInner {
         Some(session)
     }
 
+    /// Returns the existing session or creates the one outbound session for a
+    /// contact, requesting its initial dial when it already exists.
     pub(super) async fn ensure_outbound_session(self: &Arc<Self>, peer: EndpointId) -> PeerSession {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(&peer) {
@@ -211,6 +249,7 @@ impl TransportInner {
         session
     }
 
+    /// Removes sessions for peers no longer present in the allowlist.
     async fn take_removed_sessions(&self, peers: &HashSet<EndpointId>) -> Vec<PeerSession> {
         let mut sessions = self.sessions.lock().await;
         peers
@@ -219,11 +258,13 @@ impl TransportInner {
             .collect()
     }
 
+    /// Takes ownership of every session during endpoint shutdown.
     async fn take_all_sessions(&self) -> Vec<PeerSession> {
         let mut sessions = self.sessions.lock().await;
         std::mem::take(&mut *sessions).into_values().collect()
     }
 
+    /// Reads the externally visible state for one peer session, if present.
     pub(super) async fn session_state(
         &self,
         peer: EndpointId,
@@ -233,6 +274,11 @@ impl TransportInner {
     }
 }
 
+/// Binds an Iroh endpoint and starts the accept task and channel plumbing.
+///
+/// Existing contacts receive one outbound session actor each. The returned
+/// client, transport owner, and receivers share the same endpoint state and
+/// must be shut down through [`super::ChatTransport::shutdown`].
 pub(super) async fn bind(
     secret_key: SecretKey,
     contacts: ContactAllowlist,
@@ -301,6 +347,11 @@ pub(super) async fn bind(
     ))
 }
 
+/// Accepts incoming Iroh connections while enforcing the admission budget.
+///
+/// Authentication is followed by a contact-allowlist check before the
+/// connection is attached to a per-peer session. Unknown peers are refused and
+/// never reach the application message queue.
 async fn accept_loop(inner: Arc<TransportInner>) {
     while let Some(incoming) = inner.endpoint.accept().await {
         let Some(admission) = inner
@@ -378,6 +429,8 @@ async fn accept_loop(inner: Arc<TransportInner>) {
     }
 }
 
+/// Performs the minimal request/response rejection flow for an unauthorized
+/// connection, then closes it.
 async fn handle_unauthorised_connection(connection: Connection) {
     let peer = connection.remote_id();
     let connection_id = connection.stable_id();
@@ -438,6 +491,7 @@ async fn handle_unauthorised_connection(connection: Connection) {
 }
 
 impl ChatTransport {
+    /// Wraps shared transport state and its accept task.
     pub(super) fn new(
         inner: Arc<TransportInner>,
         accept_task: tokio::task::JoinHandle<()>,
@@ -445,6 +499,7 @@ impl ChatTransport {
         Self { inner, accept_task }
     }
 
+    /// Starts the transport using the default path and dial configuration.
     pub async fn start(
         secret_key: SecretKey,
         contacts: impl IntoIterator<Item = PeerId>,
@@ -460,6 +515,10 @@ impl ChatTransport {
         Self::start_with_config(secret_key, contacts, ChatTransportConfig::default()).await
     }
 
+    /// Starts the transport after validating contacts and applying `config`.
+    ///
+    /// The returned receivers carry incoming text and connection observations;
+    /// they are the only transport-to-application data paths.
     pub async fn start_with_config(
         secret_key: SecretKey,
         contacts: impl IntoIterator<Item = PeerId>,
@@ -486,6 +545,10 @@ impl ChatTransport {
         bind(secret_key, contacts, config).await
     }
 
+    /// Atomically replaces the local contact allowlist and session set.
+    ///
+    /// Removed sessions are shut down before newly added contacts are
+    /// prewarmed. Invalid peer IDs leave the previous allowlist unchanged.
     pub async fn replace_contacts(
         &self,
         contacts: impl IntoIterator<Item = PeerId>,
@@ -511,6 +574,8 @@ impl ChatTransport {
         Ok(())
     }
 
+    /// Stops accepting connections, shuts down every peer session, and closes
+    /// the Iroh endpoint.
     pub async fn shutdown(self) -> Result<(), ChatStartError> {
         let Self { inner, accept_task } = self;
         logging::log_event(
@@ -571,10 +636,12 @@ impl ChatTransport {
 }
 
 impl ChatClient {
+    /// Creates a client view over shared transport state.
     pub(super) fn new(inner: Arc<TransportInner>) -> Self {
         Self { inner }
     }
 
+    /// Returns the local logical connection state for a valid contact ID.
     pub async fn connection_state(
         &self,
         peer_id: &PeerId,
@@ -583,6 +650,12 @@ impl ChatClient {
         self.inner.session_state(endpoint_id).await
     }
 
+    /// Validates and queues one outgoing text message for a connected contact.
+    ///
+    /// Queue admission is state-sensitive: a contact still in `Connecting` is
+    /// reported as pending, a missing primary connection is rejected, and a
+    /// connected session receives a bounded deadline/cancellation pair. The
+    /// returned handle completes only after a correlated remote response.
     pub async fn send_text(
         &self,
         peer_id: PeerId,
@@ -639,6 +712,8 @@ impl ChatClient {
     }
 }
 
+/// Runs the per-message deadline and resolves a timed-out completion exactly
+/// once if no worker has already settled it.
 fn spawn_deadline(
     deadline: time::Instant,
     completion: CompletionSlot,
