@@ -1,4 +1,10 @@
-use crate::domain::{connection::ContactConnectionState, identity::PeerId, relay::RelaySource};
+use std::time::Instant;
+
+use crate::domain::{
+    connection::{ContactConnectionState, SelectedPath},
+    identity::PeerId,
+    relay::RelaySource,
+};
 use crate::logging::{self, LogFields};
 use crate::network::identity::parse_endpoint_id;
 use crate::protocol::MessageId;
@@ -60,6 +66,8 @@ pub(crate) enum UiCommand {
     PeerConnectionStateChanged {
         peer_id: PeerId,
         state: ContactConnectionState,
+        selected_path: SelectedPath,
+        connected_since: Option<Instant>,
     },
 }
 
@@ -208,11 +216,18 @@ impl TuiApp {
             SidebarTab::Contacts => self.details.contacts_scroll,
             SidebarTab::Relays => self.details.relays_scroll,
         };
+        let contact = self.active_contact();
+        let connected_for = contact.and_then(|contact| {
+            contact
+                .connected_since
+                .map(|since| Instant::now().saturating_duration_since(since))
+        });
         DetailsProps {
             focused: self.focus == Panel::Details,
             tab: self.sidebar.tab,
-            contact: self.active_contact(),
+            contact,
             relay: self.active_relay(),
+            connected_for,
             scroll,
         }
     }
@@ -696,7 +711,12 @@ impl TuiApp {
                 sent_at_unix_ms,
                 body,
             } => self.append_incoming_message(peer_id, message_id, sent_at_unix_ms, body),
-            UiCommand::PeerConnectionStateChanged { peer_id, state } => {
+            UiCommand::PeerConnectionStateChanged {
+                peer_id,
+                state,
+                selected_path,
+                connected_since,
+            } => {
                 if let Some(contact) = self
                     .data
                     .contacts
@@ -704,6 +724,19 @@ impl TuiApp {
                     .find(|contact| contact.peer_id == peer_id)
                 {
                     contact.connection_state = state;
+                    match state {
+                        ContactConnectionState::Connected => {
+                            contact.selected_path = selected_path;
+                            // Prefer the session-provided timestamp; keep an existing one
+                            // if a path-only update omits it so duration stays continuous.
+                            contact.connected_since = connected_since.or(contact.connected_since);
+                        }
+                        ContactConnectionState::Connecting
+                        | ContactConnectionState::NotConnected => {
+                            contact.selected_path = SelectedPath::unknown();
+                            contact.connected_since = None;
+                        }
+                    }
                 }
             }
         }
@@ -939,9 +972,17 @@ fn log_ui_command_applied(command: &UiCommand) {
                 .body_bytes(body.len())
                 .sent_at(*sent_at_unix_ms),
         ),
-        UiCommand::PeerConnectionStateChanged { peer_id, state } => (
+        UiCommand::PeerConnectionStateChanged {
+            peer_id,
+            state,
+            selected_path,
+            ..
+        } => (
             "ui_command_peer_connection_state_changed_applied",
-            LogFields::default().peer(peer_id).status(state.as_str()),
+            LogFields::default()
+                .peer(peer_id)
+                .status(state.as_str())
+                .detail("path_kind", selected_path.kind.as_str()),
         ),
     };
     logging::log_event("tui", event, fields);
@@ -971,6 +1012,15 @@ mod tests {
 
     fn peer_id_for_test(byte: u8) -> PeerId {
         peer_id_from_secret(&iroh::SecretKey::from_bytes(&[byte; 32]))
+    }
+
+    fn connection_state_changed(peer_id: PeerId, state: ContactConnectionState) -> UiCommand {
+        UiCommand::PeerConnectionStateChanged {
+            peer_id,
+            state,
+            selected_path: SelectedPath::unknown(),
+            connected_since: None,
+        }
     }
 
     fn app_with_contacts(contacts: Vec<ContactView>) -> TuiApp {
@@ -1274,10 +1324,10 @@ mod tests {
         app.focus = Panel::Chat;
 
         app.update(Action::OpenContextMenu);
-        app.apply_command(UiCommand::PeerConnectionStateChanged {
-            peer_id: peer.clone(),
-            state: ContactConnectionState::Connecting,
-        });
+        app.apply_command(connection_state_changed(
+            peer.clone(),
+            ContactConnectionState::Connecting,
+        ));
         app.update(Action::Activate);
 
         assert!(matches!(app.overlay.overlay, Some(Overlay::Context(_))));
@@ -1294,10 +1344,10 @@ mod tests {
         app.focus = Panel::Chat;
 
         app.update(Action::OpenContextMenu);
-        app.apply_command(UiCommand::PeerConnectionStateChanged {
-            peer_id: peer.clone(),
-            state: ContactConnectionState::Connected,
-        });
+        app.apply_command(connection_state_changed(
+            peer.clone(),
+            ContactConnectionState::Connected,
+        ));
         app.update(Action::Activate);
         assert!(matches!(
             app.overlay.overlay,
@@ -1323,30 +1373,82 @@ mod tests {
             ContactConnectionState::NotConnected
         );
 
-        app.apply_command(UiCommand::PeerConnectionStateChanged {
-            peer_id: peer.clone(),
-            state: ContactConnectionState::Connecting,
-        });
+        app.apply_command(connection_state_changed(
+            peer.clone(),
+            ContactConnectionState::Connecting,
+        ));
         assert_eq!(
             app.data.contacts[0].connection_state,
             ContactConnectionState::Connecting
         );
 
-        app.apply_command(UiCommand::PeerConnectionStateChanged {
-            peer_id: peer.clone(),
-            state: ContactConnectionState::Connected,
-        });
+        app.apply_command(connection_state_changed(
+            peer.clone(),
+            ContactConnectionState::Connected,
+        ));
         assert_eq!(
             app.data.contacts[0].connection_state,
             ContactConnectionState::Connected
         );
 
-        app.apply_command(UiCommand::PeerConnectionStateChanged {
-            peer_id: unknown,
-            state: ContactConnectionState::Connected,
-        });
+        app.apply_command(connection_state_changed(
+            unknown,
+            ContactConnectionState::Connected,
+        ));
         assert_eq!(app.data.contacts.len(), 1);
         assert_eq!(app.data.contacts[0].peer_id, peer);
+    }
+
+    #[test]
+    fn enriched_connection_updates_apply_path_and_retain_duration_across_path_migration() {
+        let peer = peer_id_for_test(41);
+        let mut app = app_with_contacts(vec![ContactView::from_peer_id(peer.clone())]);
+        let since = Instant::now();
+
+        app.apply_command(UiCommand::PeerConnectionStateChanged {
+            peer_id: peer.clone(),
+            state: ContactConnectionState::Connected,
+            selected_path: SelectedPath::new(
+                crate::domain::connection::SelectedPathKind::Relay,
+                Some("relay:https://relay.example.test.".into()),
+            ),
+            connected_since: Some(since),
+        });
+        assert_eq!(
+            app.data.contacts[0].selected_path.kind,
+            crate::domain::connection::SelectedPathKind::Relay
+        );
+        assert_eq!(app.data.contacts[0].connected_since, Some(since));
+
+        app.apply_command(UiCommand::PeerConnectionStateChanged {
+            peer_id: peer.clone(),
+            state: ContactConnectionState::Connected,
+            selected_path: SelectedPath::new(
+                crate::domain::connection::SelectedPathKind::DirectIp,
+                Some("ip:192.0.2.10:44321".into()),
+            ),
+            connected_since: Some(since),
+        });
+        assert_eq!(
+            app.data.contacts[0].selected_path.kind,
+            crate::domain::connection::SelectedPathKind::DirectIp
+        );
+        assert_eq!(
+            app.data.contacts[0].selected_path.remote_address.as_deref(),
+            Some("ip:192.0.2.10:44321")
+        );
+        assert_eq!(app.data.contacts[0].connected_since, Some(since));
+
+        let props = app.details_props();
+        assert!(props.connected_for.is_some());
+
+        app.apply_command(connection_state_changed(
+            peer,
+            ContactConnectionState::NotConnected,
+        ));
+        assert_eq!(app.data.contacts[0].selected_path, SelectedPath::unknown());
+        assert!(app.data.contacts[0].connected_since.is_none());
+        assert!(app.details_props().connected_for.is_none());
     }
 
     #[test]

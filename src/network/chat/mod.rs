@@ -1,4 +1,5 @@
 mod framing;
+mod path_diagnostics;
 mod session;
 mod transport;
 
@@ -107,10 +108,17 @@ pub struct IncomingText {
     pub body: String,
 }
 
+/// Runtime connection update for a known contact.
+///
+/// Carries the coarse session state plus selected-path diagnostics and an optional
+/// monotonic logical-session start time. Path and duration fields are runtime-only
+/// and must not introduce Iroh types into application or TUI data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerConnectionEvent {
     pub peer_id: PeerId,
     pub state: ContactConnectionState,
+    pub selected_path: crate::domain::connection::SelectedPath,
+    pub connected_since: Option<std::time::Instant>,
 }
 
 pub struct DeliveryHandle {

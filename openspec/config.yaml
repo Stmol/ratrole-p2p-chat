@@ -10,7 +10,7 @@ context: |
   Security: Device secrets stay in the platform keychain or the explicitly documented development file; public configuration must not contain secrets.
   Change discipline: Preserve existing protocol limits, authenticated contact allowlists, bounded queues, delivery semantics, TUI ownership rules, and stale-event guards unless a proposal explicitly changes them.
   Brownfield rule: Inspect the current repository and existing docs before proposing a new capability; do not invent a greenfield architecture or generate specs for unrelated subsystems.
-  Source of project-wide instructions: AGENTS.md and the repository README remain authoritative for Rathole-specific engineering constraints.
+  Source of project-wide instructions: AGENTS.md is authoritative for engineering rules; use the README for orientation and relevant specs or module docs for behavior details.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
