@@ -8,10 +8,11 @@ use tokio::{
 };
 
 use crate::{
-    domain::{contact::Contact, identity::PeerId},
+    domain::{connection::ContactConnectionState, contact::Contact, identity::PeerId},
     logging::{self, LogFields},
     network::chat::{
-        ChatClient, ChatTransport, ChatTransportConfig, DeliveryError, DeliveryHandle, IncomingText,
+        ChatClient, ChatTransport, ChatTransportConfig, DeliveryError, DeliveryHandle,
+        IncomingText, PeerConnectionEvent,
     },
     storage::ContactRepository,
     tui::{ContactView, DeliveryState, UiCommand, UiEffect},
@@ -65,7 +66,7 @@ impl ChatSession {
             .iter()
             .map(|contact| contact.peer_id().clone())
             .collect::<Vec<_>>();
-        let (transport, client, incoming_rx) =
+        let (transport, client, incoming_rx, connection_events_rx) =
             match ChatTransport::start_with_config(secret_key, peer_ids, config).await {
                 Ok(result) => result,
                 Err(error) => {
@@ -83,6 +84,7 @@ impl ChatSession {
             transport,
             client,
             incoming_rx,
+            connection_events_rx,
             effect_rx,
             command_tx,
             contacts,
@@ -119,6 +121,7 @@ struct SessionRuntime<R> {
     transport: ChatTransport,
     client: ChatClient,
     incoming_rx: mpsc::Receiver<IncomingText>,
+    connection_events_rx: mpsc::UnboundedReceiver<PeerConnectionEvent>,
     effect_rx: mpsc::Receiver<UiEffect>,
     command_tx: std::sync::mpsc::Sender<UiCommand>,
     contacts: Vec<Contact>,
@@ -149,6 +152,9 @@ impl<R: ContactRepository> SessionRuntime<R> {
                         body: incoming.body,
                     });
                 }
+                Some(event) = self.connection_events_rx.recv() => {
+                    self.handle_connection_event(event);
+                }
                 Some(effect) = self.effect_rx.recv() => {
                     self.handle_effect(effect).await;
                 }
@@ -163,6 +169,28 @@ impl<R: ContactRepository> SessionRuntime<R> {
             LogFields::default().status(if result.is_ok() { "ok" } else { "error" }),
         );
         result
+    }
+
+    fn handle_connection_event(&self, event: PeerConnectionEvent) {
+        if !self
+            .contacts
+            .iter()
+            .any(|contact| contact.peer_id() == &event.peer_id)
+        {
+            logging::log_event(
+                "session",
+                "peer_connection_event_ignored",
+                LogFields::default()
+                    .peer(&event.peer_id)
+                    .status(event.state.as_str())
+                    .reason("unknown_or_removed_contact"),
+            );
+            return;
+        }
+        self.emit(UiCommand::PeerConnectionStateChanged {
+            peer_id: event.peer_id,
+            state: event.state,
+        });
     }
 
     async fn handle_effect(&mut self, effect: UiEffect) {
@@ -285,7 +313,9 @@ impl<R: ContactRepository> SessionRuntime<R> {
                     "contact_added",
                     LogFields::default().peer(&peer_id),
                 );
-                self.emit(UiCommand::ContactAdded(ContactView::from_peer_id(peer_id)));
+                let mut contact = ContactView::from_peer_id(peer_id);
+                contact.connection_state = ContactConnectionState::Connecting;
+                self.emit(UiCommand::ContactAdded(contact));
             }
             Err(PersistError::Repository(error)) => {
                 logging::log_warn(
@@ -322,6 +352,13 @@ impl<R: ContactRepository> SessionRuntime<R> {
             ));
             return;
         };
+        if self.client.connection_state(&peer_id).await == Some(ContactConnectionState::Connecting)
+        {
+            self.emit(UiCommand::ShowStatus(
+                "Contact cannot be removed while connection check is in progress".to_owned(),
+            ));
+            return;
+        }
         match replace_contacts(
             &self.transport,
             &self.repository,
@@ -383,6 +420,8 @@ fn send_error_message(error: &DeliveryError) -> &'static str {
         DeliveryError::Validation(_) => "Message is too long",
         DeliveryError::QueueFull => "Message queue is full",
         DeliveryError::NotAContact => "Contact is not available",
+        DeliveryError::PeerConnectionPending => "Peer connection is being checked",
+        DeliveryError::PeerNotConnected => "Peer is not connected",
         DeliveryError::TimedOut => "Message timed out",
         DeliveryError::Rejected(_) => "Message was rejected",
         DeliveryError::Transport(_) | DeliveryError::ProtocolViolation => "Transport failed",
@@ -484,6 +523,10 @@ fn log_ui_command(command: &UiCommand) {
         UiCommand::ClearChat(contact_id) => (
             "ui_command_clear_chat",
             LogFields::default().peer(contact_id),
+        ),
+        UiCommand::PeerConnectionStateChanged { peer_id, state } => (
+            "ui_command_peer_connection_state_changed",
+            LogFields::default().peer(peer_id).status(state.as_str()),
         ),
     };
     logging::log_event("session", event, fields);
@@ -631,13 +674,44 @@ mod tests {
         let alice_id = peer_id_from_secret(&alice_secret);
         let bob_id = peer_id_from_secret(&bob_secret);
 
-        let (bob_transport, _bob_client, bob_incoming) =
-            ChatTransport::start(bob_secret, [alice_id]).await.unwrap();
-        let (alice_transport, alice_client, alice_incoming) =
-            ChatTransport::start(alice_secret, [bob_id.clone()])
-                .await
-                .unwrap();
+        let (bob_transport, _bob_client, bob_incoming, _bob_connection_events) =
+            ChatTransport::start_with_config(
+                bob_secret,
+                [],
+                ChatTransportConfig {
+                    dial_timeout: Duration::from_secs(5),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (alice_transport, alice_client, alice_incoming, alice_connection_events) =
+            ChatTransport::start_with_config(
+                alice_secret,
+                [],
+                ChatTransportConfig {
+                    dial_timeout: Duration::from_secs(5),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         connect_routes(&alice_transport, &bob_transport).await;
+        bob_transport.replace_contacts([alice_id]).await.unwrap();
+        alice_transport
+            .replace_contacts([bob_id.clone()])
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alice_client.connection_state(&bob_id).await
+            != Some(ContactConnectionState::Connected)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for connected bob"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (effects, effect_rx) = mpsc::channel(16);
@@ -650,6 +724,7 @@ mod tests {
             transport: alice_transport,
             client: alice_client,
             incoming_rx: alice_incoming,
+            connection_events_rx: alice_connection_events,
             effect_rx,
             command_tx,
             contacts: vec![Contact::new(bob_id.clone())],
@@ -718,6 +793,17 @@ mod tests {
         }
     }
 
+    async fn recv_non_connection_command(
+        commands: &std::sync::mpsc::Receiver<UiCommand>,
+    ) -> UiCommand {
+        loop {
+            let command = recv_command(commands).await;
+            if !matches!(command, UiCommand::PeerConnectionStateChanged { .. }) {
+                return command;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn session_shutdown_joins_the_background_transport_owner() {
         let session = started_session_for_test().await;
@@ -736,10 +822,10 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            recv_command(&fixture.commands).await,
+            recv_non_connection_command(&fixture.commands).await,
             UiCommand::OutgoingQueued { .. }
         ));
-        let settled = recv_command(&fixture.commands).await;
+        let settled = recv_non_connection_command(&fixture.commands).await;
         assert!(
             matches!(
                 settled,
@@ -759,13 +845,25 @@ mod tests {
     #[tokio::test]
     async fn send_to_removed_contact_persists_first_then_keeps_draft_via_send_rejected() {
         let fixture = session_with_contact().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match recv_command(&fixture.commands).await {
+                UiCommand::PeerConnectionStateChanged {
+                    state: ContactConnectionState::NotConnected,
+                    ..
+                } => break,
+                UiCommand::PeerConnectionStateChanged { .. } => {}
+                other => panic!("unexpected command while waiting for dial settle: {other:?}"),
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+        }
         fixture
             .effects
             .send(UiEffect::RemoveContact(fixture.bob_id.clone()))
             .await
             .unwrap();
         assert!(matches!(
-            recv_command(&fixture.commands).await,
+            recv_non_connection_command(&fixture.commands).await,
             UiCommand::ContactRemoved(_)
         ));
         fixture
@@ -777,7 +875,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            recv_command(&fixture.commands).await,
+            recv_non_connection_command(&fixture.commands).await,
             UiCommand::SendRejected {
                 peer_id: fixture.bob_id.clone(),
                 message: "Contact is not available".to_owned(),
@@ -786,6 +884,7 @@ mod tests {
         assert!(matches!(
             fixture.commands.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
+                | Ok(UiCommand::PeerConnectionStateChanged { .. })
         ));
         fixture.session.shutdown().await.unwrap();
     }
@@ -837,8 +936,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            recv_command(&commands).await,
-            UiCommand::ContactAdded(ContactView::from_peer_id(peer))
+            recv_non_connection_command(&commands).await,
+            UiCommand::ContactAdded({
+                let mut contact = ContactView::from_peer_id(peer);
+                contact.connection_state = ContactConnectionState::Connecting;
+                contact
+            })
         );
         session.shutdown().await.unwrap();
     }
@@ -894,7 +997,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            recv_command(&commands).await,
+            recv_non_connection_command(&commands).await,
             UiCommand::ContactAlreadyExists(peer)
         );
         session.shutdown().await.unwrap();

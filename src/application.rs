@@ -88,7 +88,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .map(|value| IrohPathMode::parse(&value))
                 .unwrap_or(Ok(IrohPathMode::Auto))
                 .map_err(anyhow::Error::msg)?;
-            let transport_config = ChatTransportConfig { path_mode };
+            let transport_config = ChatTransportConfig {
+                path_mode,
+                ..Default::default()
+            };
             logging::log_event(
                 "application",
                 "chat_path_mode_selected",

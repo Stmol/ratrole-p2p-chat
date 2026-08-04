@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::domain::{contact::Contact, identity::PeerId, relay::RelaySource};
+use crate::domain::{
+    connection::ContactConnectionState, contact::Contact, identity::PeerId, relay::RelaySource,
+};
 use crate::protocol::MessageId;
 
 pub type ContactId = PeerId;
@@ -10,6 +12,7 @@ pub type RelayId = usize;
 pub struct ContactView {
     pub peer_id: PeerId,
     pub unread_count: usize,
+    pub connection_state: ContactConnectionState,
 }
 
 impl ContactView {
@@ -17,6 +20,7 @@ impl ContactView {
         Self {
             peer_id,
             unread_count: 0,
+            connection_state: ContactConnectionState::NotConnected,
         }
     }
 
@@ -72,7 +76,11 @@ impl TuiData {
             own_peer_id,
             contacts: contacts
                 .into_iter()
-                .map(|contact| ContactView::from_peer_id(contact.peer_id().clone()))
+                .map(|contact| {
+                    let mut view = ContactView::from_peer_id(contact.peer_id().clone());
+                    view.connection_state = ContactConnectionState::Connecting;
+                    view
+                })
                 .collect(),
             relays: Vec::new(),
             chats: BTreeMap::new(),
@@ -150,5 +158,24 @@ mod tests {
     #[test]
     fn utc_time_label_uses_utc_clock_fields_without_a_timezone_dependency() {
         assert_eq!(utc_time_label(3_661_000), "01:01 UTC");
+    }
+
+    #[test]
+    fn from_contacts_marks_startup_contacts_as_connecting() {
+        let own = peer_id_from_secret(&iroh::SecretKey::from_bytes(&[40; 32]));
+        let peer = peer_id_from_secret(&iroh::SecretKey::from_bytes(&[41; 32]));
+        let data = TuiData::from_contacts(own.clone(), vec![Contact::new(peer.clone())]);
+
+        assert_eq!(data.own_peer_id, own);
+        assert_eq!(data.contacts.len(), 1);
+        assert_eq!(data.contacts[0].peer_id, peer);
+        assert_eq!(
+            data.contacts[0].connection_state,
+            ContactConnectionState::Connecting
+        );
+        assert_eq!(
+            ContactView::from_peer_id(peer).connection_state,
+            ContactConnectionState::NotConnected
+        );
     }
 }

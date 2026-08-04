@@ -57,12 +57,24 @@ fn contact_details(props: &DetailsProps<'_>, theme: &UiTheme) -> Text<'static> {
             Style::new().fg(theme.muted),
         )));
     };
-    Text::from(vec![labeled(
-        "Peer ID",
-        contact.peer_id.as_str().to_owned(),
-        theme.text,
-        theme.muted,
-    )])
+    let (status, color) = match contact.connection_state {
+        crate::domain::connection::ContactConnectionState::Connected => ("Connected", theme.green),
+        crate::domain::connection::ContactConnectionState::Connecting => {
+            ("Connecting", theme.amber)
+        }
+        crate::domain::connection::ContactConnectionState::NotConnected => {
+            ("Not connected", theme.muted)
+        }
+    };
+    Text::from(vec![
+        labeled(
+            "Peer ID",
+            contact.peer_id.as_str().to_owned(),
+            theme.text,
+            theme.muted,
+        ),
+        labeled_colored("Connection", status.to_owned(), color, theme.muted),
+    ])
 }
 
 fn relay_details(props: &DetailsProps<'_>, theme: &UiTheme) -> Text<'static> {
@@ -143,8 +155,9 @@ mod tests {
     };
 
     #[test]
-    fn details_show_the_complete_endpoint_id_without_presence() {
-        let contact = ContactView::from_peer_id(peer_id_for_test(4));
+    fn details_show_the_complete_endpoint_id_and_connection_status() {
+        let mut contact = ContactView::from_peer_id(peer_id_for_test(4));
+        contact.connection_state = crate::domain::connection::ContactConnectionState::Connected;
         let text = render_details_text(
             DetailsProps {
                 focused: false,
@@ -159,6 +172,10 @@ mod tests {
             20,
         );
         assert!(text.contains(contact.peer_id.as_str()));
+        assert!(text.contains("Connection"));
+        assert!(text.contains("Connected"));
+        assert!(!text.contains("Online"));
+        assert!(!text.contains("Offline"));
         assert!(!text.contains("presence"));
     }
 

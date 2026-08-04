@@ -16,10 +16,11 @@ The first client is a Rust terminal application. Future compatible clients may b
 ## Live chat MVP
 
 - Launching `rathole` starts one online Iroh chat transport for that TUI session.
-- Added local contacts can exchange 1:1 text while both clients are running and reachable. Contacts remain local and one-way.
+- On startup and when a contact is added, Rathole attempts one outbound dial per contact. Sidebar/Details show runtime `Connecting` / `Connected` / `Not connected` (local handshake state, not presence).
+- Added local contacts can exchange 1:1 text while both clients are running and the session is `Connected`. Contacts remain local and one-way.
 - Outgoing messages first show `Pending`. `Delivered` means the remote Rathole runtime accepted the message; it is not a read receipt and does not make the message durable.
 - Incoming messages for another contact receive a local unread badge, cleared when that chat is selected.
-- Message bodies, delivery states, drafts, and unread counts exist only in memory. Restarting Rathole clears them.
+- Message bodies, delivery states, drafts, unread counts, and connection status exist only in memory. Restarting Rathole clears them.
 - There is no offline delivery, retry, durable history, read receipt, presence, multi-device sync, user account, or file transfer in this MVP.
 
 ## Identity and contacts (MVP)
@@ -44,11 +45,13 @@ The first client is a Rust terminal application. Future compatible clients may b
 
 - `src/network/chat/` provides the Iroh ALPN `rathole/chat/1` transport. Launching the TUI starts exactly one transport for that session and shuts it down on exit.
 - Delivery is allowed only to locally stored contacts. Incoming authorisation uses the authenticated Iroh `EndpointId`, not an identity field inside CBOR.
-- Each contact has one long-lived Iroh connection when reachable. Every message uses a new bidirectional stream carrying exactly one `Text → Accepted | Rejected` exchange; a healthy connection stays open across messages and idle periods.
+- On startup and when a contact is added, Rathole creates one `PeerSession` per contact and makes one outbound dial attempt (5s timeout, shared concurrency limit of 8). `Connected` means a local Iroh/QUIC handshake with `CHAT_ALPN` succeeded for the selected session connection; it is not remote presence.
+- After a failed initial dial the contact becomes `Not connected` with no polling or automatic retry. A later inbound dial from the remote peer can still attach and move the session to `Connected`.
+- Each contact has one long-lived Iroh connection when reachable. Every message uses a new bidirectional stream carrying exactly one `Text → Accepted | Rejected` exchange; a healthy connection stays open across messages and idle periods. Send is blocked while `Connecting` or `Not connected`.
 - Each stream document has a four-byte big-endian length prefix and a 32 KiB maximum CBOR body. Incoming and per-peer outgoing queues are capped at 64 messages. A full per-peer outgoing queue returns `QueueFull` immediately instead of blocking the caller.
-- Messages are attempted FIFO per peer on a bounded session queue. One connection multiplexes independent message streams, and simultaneous bidirectional sends are allowed. `connection_id` is local to one process; correlate two machine logs with `message_id` and `stream_id`.
-- Delivery is online-only with a 30-second local deadline that starts when `send_text` accepts a message into the per-peer outgoing queue and covers queueing, dial, and stream I/O. There is no persistence, retry, deduplication, sequence number, offline mailbox, or presence claim yet.
-- Removing a contact closes that peer session and cancels its active stream and queued deliveries with `NotAContact`. Inbound sessions and stream handlers have separate bounded budgets; a stream protocol error resets only that stream and does not evict a healthy connection.
+- Messages are attempted FIFO per peer on a bounded session queue. One connection multiplexes independent message streams, and simultaneous bidirectional sends are allowed. When both sides dial at once, a deterministic local/remote EndpointId rule keeps exactly one preferred connection. `connection_id` is local to one process; correlate two machine logs with `message_id` and `stream_id`.
+- Delivery is online-only with a 30-second local deadline that starts when `send_text` accepts a message into the per-peer outgoing queue and covers queueing and stream I/O. The initial contact dial timeout is separate (5s) and does not admit messages. There is no persistence, retry, deduplication, sequence number, offline mailbox, or presence claim yet.
+- Removing a contact closes that peer session and cancels its active stream and queued deliveries with `NotAContact`. Removal is blocked while the contact is still `Connecting`. Inbound sessions and stream handlers have separate bounded budgets; a stream protocol error resets only that stream and does not evict a healthy connection.
 
 ## Run
 

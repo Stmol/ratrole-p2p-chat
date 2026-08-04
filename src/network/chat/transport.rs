@@ -3,6 +3,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey,
     endpoint::{Connection, presets},
@@ -20,7 +23,7 @@ use super::{
     CHAT_ALPN, ChatClient, ChatStartError, ChatTransport, ChatTransportConfig, CompletionSlot,
     ContactAllowlist, DELIVERY_TIMEOUT, DeliveryError, DeliveryHandle, INBOUND_STREAM_TIMEOUT,
     INCOMING_QUEUE_CAPACITY, IncomingText, MAX_INBOUND_HANDLERS, MAX_INBOUND_SESSIONS,
-    MAX_INBOUND_STREAM_HANDLERS, random_message_id, unix_ms_now,
+    MAX_INBOUND_STREAM_HANDLERS, MAX_OUTBOUND_DIALS, random_message_id, unix_ms_now,
 };
 use crate::domain::identity::PeerId;
 use crate::logging::{self, LogFields};
@@ -31,13 +34,19 @@ pub(super) struct TransportInner {
     pub(super) endpoint: Endpoint,
     pub(super) contacts: ContactAllowlist,
     pub(super) incoming_tx: mpsc::Sender<IncomingText>,
+    pub(super) connection_events_tx: mpsc::UnboundedSender<super::PeerConnectionEvent>,
     pub(super) sessions: Mutex<HashMap<EndpointId, PeerSession>>,
     pub(super) inbound_sessions: Arc<Semaphore>,
     pub(super) inbound_stream_handlers: Arc<Semaphore>,
     pub(super) inbound_connection_admissions: Arc<Semaphore>,
+    pub(super) outbound_dials: Arc<Semaphore>,
     pub(super) config: ChatTransportConfig,
     #[cfg(test)]
     pub(super) test_routes: Mutex<HashMap<EndpointId, EndpointAddr>>,
+    #[cfg(test)]
+    pub(super) dial_attempts: AtomicUsize,
+    #[cfg(test)]
+    pub(super) dial_peak_occupancy: AtomicUsize,
 }
 
 impl TransportInner {
@@ -45,19 +54,26 @@ impl TransportInner {
         endpoint: Endpoint,
         contacts: ContactAllowlist,
         incoming_tx: mpsc::Sender<IncomingText>,
+        connection_events_tx: mpsc::UnboundedSender<super::PeerConnectionEvent>,
         config: ChatTransportConfig,
     ) -> Self {
         Self {
             endpoint,
             contacts,
             incoming_tx,
+            connection_events_tx,
             sessions: Mutex::new(HashMap::new()),
             inbound_sessions: Arc::new(Semaphore::new(MAX_INBOUND_SESSIONS)),
             inbound_stream_handlers: Arc::new(Semaphore::new(MAX_INBOUND_STREAM_HANDLERS)),
             inbound_connection_admissions: Arc::new(Semaphore::new(MAX_INBOUND_HANDLERS)),
+            outbound_dials: Arc::new(Semaphore::new(MAX_OUTBOUND_DIALS)),
             config,
             #[cfg(test)]
             test_routes: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            dial_attempts: AtomicUsize::new(0),
+            #[cfg(test)]
+            dial_peak_occupancy: AtomicUsize::new(0),
         }
     }
 
@@ -66,6 +82,25 @@ impl TransportInner {
         peer: EndpointId,
         deadline: tokio::time::Instant,
     ) -> Result<Connection, String> {
+        let permit = time::timeout_at(deadline, self.outbound_dials.clone().acquire_owned())
+            .await
+            .map_err(|_| "connection dial timed out".to_owned())?
+            .map_err(|_| "outbound dial semaphore closed".to_owned())?;
+
+        #[cfg(test)]
+        {
+            self.dial_attempts.fetch_add(1, Ordering::AcqRel);
+            let in_flight =
+                MAX_OUTBOUND_DIALS.saturating_sub(self.outbound_dials.available_permits());
+            self.dial_peak_occupancy
+                .fetch_max(in_flight, Ordering::AcqRel);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            drop(permit);
+            return Err("connection dial timed out".to_owned());
+        }
+
         let addr = self.dial_addr_for(peer).await;
         logging::log_event(
             "transport",
@@ -77,7 +112,9 @@ impl TransportInner {
         let connection = time::timeout_at(deadline, self.endpoint.connect(addr, CHAT_ALPN))
             .await
             .map_err(|_| "connection dial timed out".to_owned())?
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string());
+        drop(permit);
+        let connection = connection?;
         self.log_connection_snapshot(
             "transport",
             "connection_dial_succeeded",
@@ -85,6 +122,14 @@ impl TransportInner {
             None,
             &connection,
             None,
+        );
+        logging::log_event(
+            "transport",
+            "connection_dial_finished",
+            LogFields::default()
+                .peer_str(peer.to_string())
+                .connection(connection.stable_id())
+                .status("ok"),
         );
         Ok(connection)
     }
@@ -142,15 +187,30 @@ impl TransportInner {
         logging::log_event(component, event, fields);
     }
 
+    pub(super) fn emit_connection_event(&self, event: super::PeerConnectionEvent) {
+        let _ = self.connection_events_tx.send(event);
+    }
+
     async fn session_for_inbound(self: &Arc<Self>, peer: EndpointId) -> Option<PeerSession> {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(&peer) {
             return Some(session.clone());
         }
         let permit = self.inbound_sessions.clone().try_acquire_owned().ok()?;
-        let session = PeerSession::spawn(peer, self.clone(), Some(permit));
+        let session = PeerSession::spawn(peer, self.clone(), Some(permit), false);
         sessions.insert(peer, session.clone());
         Some(session)
+    }
+
+    pub(super) async fn ensure_outbound_session(self: &Arc<Self>, peer: EndpointId) -> PeerSession {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(&peer) {
+            session.request_outbound_dial();
+            return session.clone();
+        }
+        let session = PeerSession::spawn(peer, self.clone(), None, true);
+        sessions.insert(peer, session.clone());
+        session
     }
 
     async fn take_removed_sessions(&self, peers: &HashSet<EndpointId>) -> Vec<PeerSession> {
@@ -165,13 +225,29 @@ impl TransportInner {
         let mut sessions = self.sessions.lock().await;
         std::mem::take(&mut *sessions).into_values().collect()
     }
+
+    pub(super) async fn session_state(
+        &self,
+        peer: EndpointId,
+    ) -> Option<crate::domain::connection::ContactConnectionState> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(&peer).map(PeerSession::connection_state)
+    }
 }
 
 pub(super) async fn bind(
     secret_key: SecretKey,
     contacts: ContactAllowlist,
     config: ChatTransportConfig,
-) -> Result<(ChatTransport, ChatClient, mpsc::Receiver<IncomingText>), ChatStartError> {
+) -> Result<
+    (
+        ChatTransport,
+        ChatClient,
+        mpsc::Receiver<IncomingText>,
+        mpsc::UnboundedReceiver<super::PeerConnectionEvent>,
+    ),
+    ChatStartError,
+> {
     #[cfg(not(test))]
     let endpoint = {
         let builder = Endpoint::builder(presets::N0)
@@ -200,6 +276,7 @@ pub(super) async fn bind(
         .map_err(|error| ChatStartError::Bind(error.to_string()))?;
 
     let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_QUEUE_CAPACITY);
+    let (connection_events_tx, connection_events_rx) = mpsc::unbounded_channel();
     logging::log_event(
         "transport",
         "transport_bound",
@@ -207,12 +284,22 @@ pub(super) async fn bind(
             .detail("endpoint_id", endpoint.id().to_string())
             .detail("path_mode", config.path_mode.as_str()),
     );
-    let inner = Arc::new(TransportInner::new(endpoint, contacts, incoming_tx, config));
+    let inner = Arc::new(TransportInner::new(
+        endpoint,
+        contacts,
+        incoming_tx,
+        connection_events_tx,
+        config,
+    ));
+    for peer in inner.contacts.snapshot().await {
+        let _ = inner.ensure_outbound_session(peer).await;
+    }
     let accept_task = tokio::spawn(accept_loop(inner.clone()));
     Ok((
         ChatTransport::new(inner.clone(), accept_task),
         ChatClient::new(inner),
         incoming_rx,
+        connection_events_rx,
     ))
 }
 
@@ -363,7 +450,15 @@ impl ChatTransport {
     pub async fn start(
         secret_key: SecretKey,
         contacts: impl IntoIterator<Item = PeerId>,
-    ) -> Result<(Self, ChatClient, mpsc::Receiver<IncomingText>), ChatStartError> {
+    ) -> Result<
+        (
+            Self,
+            ChatClient,
+            mpsc::Receiver<IncomingText>,
+            mpsc::UnboundedReceiver<super::PeerConnectionEvent>,
+        ),
+        ChatStartError,
+    > {
         Self::start_with_config(secret_key, contacts, ChatTransportConfig::default()).await
     }
 
@@ -371,7 +466,15 @@ impl ChatTransport {
         secret_key: SecretKey,
         contacts: impl IntoIterator<Item = PeerId>,
         config: ChatTransportConfig,
-    ) -> Result<(Self, ChatClient, mpsc::Receiver<IncomingText>), ChatStartError> {
+    ) -> Result<
+        (
+            Self,
+            ChatClient,
+            mpsc::Receiver<IncomingText>,
+            mpsc::UnboundedReceiver<super::PeerConnectionEvent>,
+        ),
+        ChatStartError,
+    > {
         let contacts = contacts.into_iter().collect::<Vec<_>>();
         logging::log_event(
             "transport",
@@ -390,7 +493,7 @@ impl ChatTransport {
         contacts: impl IntoIterator<Item = PeerId>,
     ) -> Result<(), ChatStartError> {
         let contacts = contacts.into_iter().collect::<Vec<_>>();
-        let removed = self
+        let (added, removed) = self
             .inner
             .contacts
             .replace_peer_ids(contacts)
@@ -398,6 +501,9 @@ impl ChatTransport {
             .map_err(|error| ChatStartError::InvalidContact(error.to_string()))?;
         for session in self.inner.take_removed_sessions(&removed).await {
             session.shutdown(DeliveryError::NotAContact).await;
+        }
+        for peer in added {
+            let _ = self.inner.ensure_outbound_session(peer).await;
         }
         logging::log_event(
             "transport",
@@ -446,11 +552,37 @@ impl ChatTransport {
     pub(crate) async fn install_test_route(&self, peer: EndpointId, address: EndpointAddr) {
         self.inner.test_routes.lock().await.insert(peer, address);
     }
+
+    #[cfg(test)]
+    pub(crate) async fn drop_session_for_test(&self, peer: EndpointId) {
+        let session = self.inner.sessions.lock().await.remove(&peer);
+        if let Some(session) = session {
+            session.shutdown(DeliveryError::ShutDown).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dial_attempt_count(&self) -> usize {
+        self.inner.dial_attempts.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dial_peak_occupancy(&self) -> usize {
+        self.inner.dial_peak_occupancy.load(Ordering::Acquire)
+    }
 }
 
 impl ChatClient {
     pub(super) fn new(inner: Arc<TransportInner>) -> Self {
         Self { inner }
+    }
+
+    pub async fn connection_state(
+        &self,
+        peer_id: &PeerId,
+    ) -> Option<crate::domain::connection::ContactConnectionState> {
+        let endpoint_id = peer_id_to_endpoint_id(peer_id).ok()?;
+        self.inner.session_state(endpoint_id).await
     }
 
     pub async fn send_text(
@@ -464,6 +596,22 @@ impl ChatClient {
         if !self.inner.contacts.contains(&endpoint_id).await {
             return Err(DeliveryError::NotAContact);
         }
+        let session = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions
+                .get(&endpoint_id)
+                .cloned()
+                .ok_or(DeliveryError::PeerNotConnected)?
+        };
+        match session.connection_state() {
+            crate::domain::connection::ContactConnectionState::Connecting => {
+                return Err(DeliveryError::PeerConnectionPending);
+            }
+            crate::domain::connection::ContactConnectionState::NotConnected => {
+                return Err(DeliveryError::PeerNotConnected);
+            }
+            crate::domain::connection::ContactConnectionState::Connected => {}
+        }
         let message_id = random_message_id();
         let sent_at_unix_ms = unix_ms_now();
         let envelope = WireEnvelope::new(ChatFrame::text(message_id, sent_at_unix_ms, body)?);
@@ -472,13 +620,6 @@ impl ChatClient {
         let (completion_tx, completion_rx) = oneshot::channel();
         let completion: CompletionSlot = Arc::new(Mutex::new(Some(completion_tx)));
         let cancellation = Arc::new(super::DeliveryCancellation::new());
-        let session = {
-            let mut sessions = self.inner.sessions.lock().await;
-            sessions
-                .entry(endpoint_id)
-                .or_insert_with(|| PeerSession::spawn(endpoint_id, self.inner.clone(), None))
-                .clone()
-        };
         let delivery = QueuedDelivery {
             envelope,
             message_id,

@@ -115,6 +115,11 @@ fn render_context(
             };
             let text = if *enabled {
                 (*label).to_owned()
+            } else if matches!(
+                action,
+                MenuAction::RemoveContact(_) | MenuAction::ClearChat(_)
+            ) {
+                format!("{label} (connection check in progress)")
             } else {
                 format!("{label} (built-in)")
             };

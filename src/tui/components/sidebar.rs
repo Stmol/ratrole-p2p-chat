@@ -44,7 +44,7 @@ pub fn render_sidebar(
 
     let list_area = padded_vertical(list_area, config.content_padding_y).unwrap_or(list_area);
     match props.tab {
-        SidebarTab::Contacts => render_contacts(frame, list_area, &props, theme),
+        SidebarTab::Contacts => render_contacts(frame, list_area, &props, config, theme),
         SidebarTab::Relays => render_relays(frame, list_area, &props, config, theme),
     }
 }
@@ -71,7 +71,13 @@ fn tab_label_style(selected: bool, theme: &UiTheme) -> Style {
     }
 }
 
-fn render_contacts(frame: &mut Frame, area: Rect, props: &SidebarProps<'_>, theme: &UiTheme) {
+fn render_contacts(
+    frame: &mut Frame,
+    area: Rect,
+    props: &SidebarProps<'_>,
+    config: &SidebarConfig,
+    theme: &UiTheme,
+) {
     if props.contacts.is_empty() {
         frame.render_widget(
             Paragraph::new("No contacts — x to add a peer")
@@ -86,6 +92,7 @@ fn render_contacts(frame: &mut Frame, area: Rect, props: &SidebarProps<'_>, them
         .contacts
         .iter()
         .map(|contact| {
+            let (glyph, color) = connection_marker(contact.connection_state, config, theme);
             let label = if contact.unread_count == 0 {
                 short_peer_id(&contact.peer_id)
             } else {
@@ -95,11 +102,27 @@ fn render_contacts(frame: &mut Frame, area: Rect, props: &SidebarProps<'_>, them
                     contact.unread_count
                 )
             };
-            ListItem::new(Line::from(Span::styled(label, Style::new().fg(theme.text))))
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{glyph} "), Style::new().fg(color)),
+                Span::styled(label, Style::new().fg(theme.text)),
+            ]))
         })
         .collect();
 
     render_selectable_list(frame, area, items, props.selected, theme)
+}
+
+fn connection_marker(
+    state: crate::domain::connection::ContactConnectionState,
+    config: &SidebarConfig,
+    theme: &UiTheme,
+) -> (&'static str, ratatui::style::Color) {
+    use crate::domain::connection::ContactConnectionState;
+    match state {
+        ContactConnectionState::Connected => (config.active_glyph, theme.green),
+        ContactConnectionState::Connecting => (config.connecting_glyph, theme.amber),
+        ContactConnectionState::NotConnected => (config.inactive_glyph, theme.muted),
+    }
 }
 
 fn render_relays(

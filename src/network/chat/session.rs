@@ -17,8 +17,9 @@ use super::framing::{FrameError, read_single_document, write_document};
 use super::transport::TransportInner;
 use super::{
     CompletionSlot, DeliveryCancellation, DeliveryError, DeliveryReceipt, INBOUND_STREAM_TIMEOUT,
-    IncomingText, OUTGOING_QUEUE_CAPACITY, resolve_once, unix_ms_now,
+    IncomingText, OUTGOING_QUEUE_CAPACITY, PeerConnectionEvent, resolve_once, unix_ms_now,
 };
+use crate::domain::{connection::ContactConnectionState, identity::PeerId};
 use crate::logging::{self, LogFields};
 use crate::protocol::{ChatFrame, MessageId, RejectionCode, WireEnvelope};
 
@@ -38,6 +39,7 @@ pub(super) struct PeerSession {
     control: mpsc::UnboundedSender<SessionControl>,
     join: Arc<Mutex<Option<JoinHandle<()>>>>,
     queued: Arc<AtomicUsize>,
+    state: watch::Receiver<ContactConnectionState>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -46,6 +48,17 @@ enum SessionState {
     Connecting,
     Connected,
     Closing,
+}
+
+impl SessionState {
+    fn as_external(self) -> Option<ContactConnectionState> {
+        match self {
+            Self::Connecting => Some(ContactConnectionState::Connecting),
+            Self::Connected => Some(ContactConnectionState::Connected),
+            Self::Disconnected => Some(ContactConnectionState::NotConnected),
+            Self::Closing => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -105,6 +118,7 @@ enum SessionControl {
         result: Result<DeliveryReceipt, DeliveryError>,
     },
     Shutdown(DeliveryError),
+    StartOutboundDial,
 }
 
 impl PeerSession {
@@ -112,12 +126,19 @@ impl PeerSession {
         peer: EndpointId,
         inner: Arc<TransportInner>,
         session_permit: Option<OwnedSemaphorePermit>,
+        start_outbound: bool,
     ) -> Self {
         let (tx, rx) = mpsc::channel(OUTGOING_QUEUE_CAPACITY);
         let (control, control_rx) = mpsc::unbounded_channel();
         let queued = Arc::new(AtomicUsize::new(0));
         let queued_for_actor = queued.clone();
         let actor_control = control.clone();
+        let initial_state = if start_outbound {
+            ContactConnectionState::Connecting
+        } else {
+            ContactConnectionState::NotConnected
+        };
+        let (state_tx, state_rx) = watch::channel(initial_state);
         let join = tokio::spawn(async move {
             let mut actor = SessionActor::new(
                 peer,
@@ -127,6 +148,8 @@ impl PeerSession {
                 actor_control,
                 session_permit,
                 queued_for_actor,
+                state_tx,
+                start_outbound,
             );
             actor.run().await;
         });
@@ -135,7 +158,12 @@ impl PeerSession {
             control,
             join: Arc::new(Mutex::new(Some(join))),
             queued,
+            state: state_rx,
         }
+    }
+
+    pub(super) fn connection_state(&self) -> ContactConnectionState {
+        *self.state.borrow()
     }
 
     pub(super) fn try_enqueue(&self, delivery: QueuedDelivery) -> Result<(), DeliveryError> {
@@ -168,6 +196,10 @@ impl PeerSession {
         });
     }
 
+    pub(super) fn request_outbound_dial(&self) {
+        let _ = self.control.send(SessionControl::StartOutboundDial);
+    }
+
     pub(super) async fn shutdown(&self, reason: DeliveryError) {
         let _ = self.control.send(SessionControl::Shutdown(reason));
         if let Some(join) = self.join.lock().await.take() {
@@ -185,15 +217,19 @@ struct SessionActor {
     session_permit: Option<OwnedSemaphorePermit>,
     queue: VecDeque<QueuedDelivery>,
     state: SessionState,
+    state_tx: watch::Sender<ContactConnectionState>,
     primary: Option<ConnectionSlot>,
     draining: Vec<ConnectionSlot>,
     active: Option<ActiveDelivery>,
     dial_in_progress: bool,
+    dial_attempted: bool,
+    start_outbound: bool,
     stopping: bool,
     queued: Arc<AtomicUsize>,
 }
 
 impl SessionActor {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         peer: EndpointId,
         inner: Arc<TransportInner>,
@@ -202,6 +238,8 @@ impl SessionActor {
         control: mpsc::UnboundedSender<SessionControl>,
         session_permit: Option<OwnedSemaphorePermit>,
         queued: Arc<AtomicUsize>,
+        state_tx: watch::Sender<ContactConnectionState>,
+        start_outbound: bool,
     ) -> Self {
         Self {
             peer,
@@ -212,17 +250,23 @@ impl SessionActor {
             session_permit,
             queue: VecDeque::new(),
             state: SessionState::Disconnected,
+            state_tx,
             primary: None,
             draining: Vec::new(),
             active: None,
             dial_in_progress: false,
+            dial_attempted: false,
+            start_outbound,
             stopping: false,
             queued,
         }
     }
 
     async fn run(&mut self) {
-        self.log_state(SessionState::Disconnected);
+        if self.start_outbound {
+            self.begin_dial(Instant::now() + self.inner.config.dial_timeout)
+                .await;
+        }
         loop {
             if self.stopping {
                 break;
@@ -266,6 +310,18 @@ impl SessionActor {
                         self.start_pending_delivery();
                     }
                     Err(error) => {
+                        logging::log_warn(
+                            "session",
+                            if error == "connection dial timed out" {
+                                "connection_dial_timed_out"
+                            } else {
+                                "connection_dial_finished"
+                            },
+                            LogFields::default()
+                                .peer_str(self.peer.to_string())
+                                .reason(error.clone())
+                                .status("error"),
+                        );
                         if self.primary.is_none() {
                             self.log_state(SessionState::Disconnected);
                         }
@@ -275,12 +331,11 @@ impl SessionActor {
                             .is_some_and(|active| active.connection_id.is_none())
                             && let Some(active) = self.active.take()
                         {
-                            let delivery_error = if error == "connection dial timed out" {
-                                DeliveryError::TimedOut
-                            } else {
-                                DeliveryError::Transport(error.clone())
-                            };
-                            force_finish_command(&active.command, Err(delivery_error)).await;
+                            force_finish_command(
+                                &active.command,
+                                Err(DeliveryError::PeerNotConnected),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -361,6 +416,12 @@ impl SessionActor {
                 self.stopping = true;
                 self.finish_shutdown(reason).await;
             }
+            SessionControl::StartOutboundDial => {
+                if self.primary.is_none() {
+                    self.begin_dial(Instant::now() + self.inner.config.dial_timeout)
+                        .await;
+                }
+            }
         }
     }
 
@@ -384,15 +445,9 @@ impl SessionActor {
                 continue;
             }
             let Some(primary) = self.primary.as_ref() else {
-                let deadline = command.deadline;
                 self.release_queued_slot();
-                self.active = Some(ActiveDelivery {
-                    command,
-                    connection_id: None,
-                    task: None,
-                });
-                self.begin_dial(deadline).await;
-                return;
+                finish_command(&command, Err(DeliveryError::PeerNotConnected)).await;
+                continue;
             };
             let connection = primary.connection.clone();
             self.release_queued_slot();
@@ -445,9 +500,10 @@ impl SessionActor {
     }
 
     async fn begin_dial(&mut self, deadline: Instant) {
-        if self.dial_in_progress || self.stopping {
+        if self.dial_in_progress || self.stopping || self.dial_attempted {
             return;
         }
+        self.dial_attempted = true;
         self.dial_in_progress = true;
         self.log_state(SessionState::Connecting);
         let inner = self.inner.clone();
@@ -679,6 +735,17 @@ impl SessionActor {
                 .peer_str(self.peer.to_string())
                 .status(format!("{state:?}")),
         );
+        if let Some(external) = state.as_external() {
+            self.publish_external_state(external);
+        }
+    }
+
+    fn publish_external_state(&mut self, state: ContactConnectionState) {
+        let _ = self.state_tx.send(state);
+        self.inner.emit_connection_event(PeerConnectionEvent {
+            peer_id: PeerId::from_canonical(self.peer.to_string()),
+            state,
+        });
     }
 }
 
