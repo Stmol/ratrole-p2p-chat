@@ -13,6 +13,26 @@ The first client is a Rust terminal application. Future compatible clients may b
 - Messages, drafts, delivery states, unread counts, and connection state are in memory and disappear on restart. There is no offline delivery, retry, durable history, presence, multi-device sync, user account, or file transfer yet.
 - The normal profile stores the device secret in the operating-system keychain. Never copy or share that secret; use `just dev` for local testing.
 
+## Alpha release for testers
+
+Download the alpha release archive from [GitHub Releases](https://github.com/Stmol/ratrole-p2p-chat/releases).
+
+For `v0.1.0-alpha.1`, choose the archive for your platform:
+
+- `universal-apple-darwin` for Intel and Apple Silicon Macs.
+- `x86_64-unknown-linux-gnu` for 64-bit Linux.
+- `x86_64-pc-windows-msvc` for 64-bit Windows.
+
+No Rust, Cargo, Just, development certificates, or local build environment are
+required. Extract the archive and run `rathole` from a terminal because the
+application is a terminal user interface. On the first launch, Rathole creates
+and stores a device identity in the operating-system Keychain. Share only your
+public Peer ID with the other tester; never share the device secret.
+
+The macOS alpha archive is not notarized. If Gatekeeper blocks the first launch,
+try to run the binary once and then allow it in **System Settings → Privacy &
+Security → Open Anyway**.
+
 ## Requirements
 
 - Stable Rust 1.91 or newer.
