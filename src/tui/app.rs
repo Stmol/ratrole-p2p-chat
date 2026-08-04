@@ -11,7 +11,7 @@ use super::{
         props::{
             self, ChatProps, DetailsProps, FooterProps, InputContext, OverlayProps, SidebarProps,
         },
-        state::{ChatState, DetailsState, OverlayState, SidebarState},
+        state::{CONNECTING_FRAME_COUNT, ChatState, DetailsState, OverlayState, SidebarState},
     },
     config::UiConfig,
     model::{
@@ -169,6 +169,7 @@ impl TuiApp {
             contacts: &self.data.contacts,
             relays: &self.data.relays,
             selected,
+            connecting_frame: self.sidebar.connecting_frame,
         }
     }
 
@@ -304,6 +305,18 @@ impl TuiApp {
             } else {
                 true
             };
+    }
+
+    pub(crate) fn advance_connecting_animation(&mut self) {
+        if self
+            .data
+            .contacts
+            .iter()
+            .any(|contact| contact.connection_state == ContactConnectionState::Connecting)
+        {
+            self.sidebar.connecting_frame =
+                (self.sidebar.connecting_frame + 1) % CONNECTING_FRAME_COUNT;
+        }
     }
 
     fn set_focus(&mut self, focus: Panel) {
@@ -1334,6 +1347,27 @@ mod tests {
         });
         assert_eq!(app.data.contacts.len(), 1);
         assert_eq!(app.data.contacts[0].peer_id, peer);
+    }
+
+    #[test]
+    fn connecting_animation_advances_only_while_a_contact_is_connecting() {
+        let peer = peer_id_for_test(1);
+        let mut contact = ContactView::from_peer_id(peer);
+        contact.connection_state = ContactConnectionState::Connecting;
+        let mut app = app_with_contacts(vec![contact]);
+
+        assert_eq!(app.sidebar_props().connecting_frame, 0);
+        app.advance_connecting_animation();
+        assert_eq!(app.sidebar_props().connecting_frame, 1);
+
+        for _ in 0..CONNECTING_FRAME_COUNT - 1 {
+            app.advance_connecting_animation();
+        }
+        assert_eq!(app.sidebar_props().connecting_frame, 0);
+
+        app.data.contacts[0].connection_state = ContactConnectionState::Connected;
+        app.advance_connecting_animation();
+        assert_eq!(app.sidebar_props().connecting_frame, 0);
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub(crate) struct SidebarProps<'a> {
     pub contacts: &'a [ContactView],
     pub relays: &'a [RelayView],
     pub selected: usize,
+    pub connecting_frame: usize,
 }
 
 pub(crate) struct ChatProps<'a> {
